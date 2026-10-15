@@ -9,34 +9,37 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macOS Apple Silicon runner 上 Homebrew 的 fakeroot 与系统 arm64e 二进制
+    # 不兼容（dyld 拒绝注入 libfakeroot.dylib），stage 阶段必挂。
+    # Theos 官方支持 Linux 打包，fakeroot 原生可用，因此用 Ubuntu runner。
+    runs-on: ubuntu-22.04
     env:
       THEOS: ${{ github.workspace }}/theos
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install Linux dependencies
         run: |
-          brew install ldid dpkg fakeroot make
-          echo "$(brew --prefix)/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential fakeroot rsync curl perl zip git libxml2 xz-utils ldid
+          # Theos 官方安装脚本在 Linux 上会切换到 fakeroot-sysv 后端
+          sudo update-alternatives --set fakeroot /usr/bin/fakeroot-sysv || true
 
       - name: Set up Theos
         run: |
           set -e
           git clone --recursive https://github.com/theos/theos.git "$THEOS"
-          mkdir -p "$THEOS/sdks"
-          SDK_VER=iPhoneOS16.5.sdk
-          if curl -fSL -o /tmp/sdk.tar.xz "https://github.com/theos/sdks/raw/master/${SDK_VER}.tar.xz"; then
-            echo "Using official SDK tarball"
-            tar -xvf /tmp/sdk.tar.xz -C "$THEOS/sdks"
-          else
-            echo "Tarball failed, falling back to sparse-clone"
-            git clone --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
-            (cd /tmp/sdks && git sparse-checkout set "$SDK_VER")
-            cp -R "/tmp/sdks/$SDK_VER" "$THEOS/sdks/"
-          fi
-          ls -la "$THEOS/sdks"
+          # 安装 iOS SDK（脚本从 theos/sdks 拉取最新可用版本）
+          "$THEOS/bin/install-sdk" latest
+          # 安装 Linux 版 iOS LLVM 工具链（与官方 install-theos 脚本一致）
+          ARCH=$(uname -m)
+          curl -sL "https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-${ARCH}.tar.xz" \
+            | tar -xJ -C "$THEOS/toolchain/"
+          # 验证关键工具就位
+          ls "$THEOS/toolchain/linux/iphone/bin/clang"
+          which ldid dpkg-deb fakeroot
 
       - name: Build & package (solver)
         run: make package FINALPACKAGE=1
