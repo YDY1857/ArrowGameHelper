@@ -1,0 +1,9 @@
+Package: com.yourname.arrowgamerecon
+Name: ArrowGameRecon
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: Recon tweak that dumps Alipay mini-game view hierarchy, classes and package paths for reverse engineering.
+Maintainer: Your Name <you@example.com>
+Author: Your Name <you@example.com>
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
