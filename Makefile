@@ -4,7 +4,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = ArrowGameHelper
 ArrowGameHelper_FILES = Tweak.x Solver.m
-ArrowGameHelper_CFLAGS = -fobjc-arc
+ArrowGameHelper_CFLAGS = -fobjc-arc -Wno-error=deprecated-declarations
 ArrowGameHelper_PRIVATE_FRAMEWORKS = 
 ArrowGameHelper_EXTRA_FRAMEWORKS = 
 

@@ -6,6 +6,35 @@
 static UIWindow *gOverlayWindow = nil;
 static UIView *gMarkerContainer = nil;
 
+// iOS 13+: keyWindow is deprecated; use the scene API instead.
+// Falls back to a runtime keyWindow call on older systems (no compile-time deprecation).
+static UIWindow *getMainWindow(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    NSSet<UIScene *> *scenes = app.connectedScenes;
+    for (UIScene *scene in scenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            UIWindow *found = nil;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) { found = w; break; }
+            }
+            if (!found) found = ws.windows.firstObject;
+            if (found) return found;
+        }
+    }
+    SEL kw = NSSelectorFromString(@"keyWindow");
+    if ([app respondsToSelector:kw]) {
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:[app methodSignatureForSelector:kw]];
+        inv.target = app;
+        inv.selector = kw;
+        [inv invoke];
+        __unsafe_unretained UIWindow *win = nil;
+        [inv getReturnValue:&win];
+        return win;
+    }
+    return nil;
+}
+
 // Helper to load a manually-entered grid from a plist.
 // Expected format under key "grid": array of rows, each row an array of integers
 // 0 = empty, 1 = up, 2 = down, 3 = left, 4 = right
@@ -60,7 +89,7 @@ static UIView *makeMarker(NSString *text, CGPoint center) {
 static void showSolutionOverlay(NSArray<ArrowCell *> *solution, CGRect boardRect, NSInteger rows, NSInteger cols) {
     if (!gOverlayWindow) {
         gOverlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        gOverlayWindow.windowLevel = UIWindowLevelAlert + 100;
+        gOverlayWindow.windowLevel = 10000; // above alert (2000), avoids deprecated UIWindowLevelAlert
         gOverlayWindow.userInteractionEnabled = NO;
         gOverlayWindow.hidden = NO;
     }
@@ -98,7 +127,7 @@ static void runSolver(void) {
                                                                        message:@"未读取到 grid 数据。请在 /var/mobile/Library/Preferences/com.yourname.arrowgamehelper.plist 的 grid 键中写入盘面。"
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
+        UIViewController *root = getMainWindow().rootViewController;
         [root presentViewController:alert animated:YES completion:nil];
         return;
     }
@@ -112,7 +141,7 @@ static void runSolver(void) {
                                                                        message:@"当前盘面无可行解，请检查 grid 数据。"
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
+        UIViewController *root = getMainWindow().rootViewController;
         [root presentViewController:alert animated:YES completion:nil];
         return;
     }
