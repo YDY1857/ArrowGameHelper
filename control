@@ -1,0 +1,9 @@
+Package: com.yourname.arrowgamehelper
+Name: ArrowGameHelper
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: Assist overlay for arrow sliding mini-games in Alipay. Shows the safe click order.
+Maintainer: Your Name <you@example.com>
+Author: Your Name <you@example.com>
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)

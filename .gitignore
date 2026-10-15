@@ -1,0 +1,12 @@
+# Theos build artifacts
+packages/
+obj/
+.theos/
+
+# Xcode / macOS
+.DS_Store
+*.xcuserdatad
+project.xcworkspace/
+
+# Windows
+Thumbs.db
