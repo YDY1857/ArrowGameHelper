@@ -105,7 +105,7 @@ git push -u origin main
 2. **Repository name**：填 `ArrowGameHelper`（或你喜欢的名字，英文、连字符、下划线均可）。
 3. **Description**：可留空或写 “Alipay arrow game helper tweak”。
 4. **Visibility**：默认建议选 **Private**（代码只有你能看）。
-   - ⚠️ 提醒：GitHub **Public** 仓库的 Actions 免费额度更宽、macOS runner 用起来最省心，但**代码会完全公开**。若你只是自己编译用、介意代码外泄，选 Private；若想图省事免费跑 macOS 编译，选 Public。两种都能正常编译出 deb。
+   - ⚠️ 提醒：GitHub **Public** 仓库 Actions 免费额度更宽；Private 也有免费额度（Ubuntu runner 也在免费范围内），正常编译一个 tweak 绰绰有余。Public 代码完全公开，介意就选 Private。
 5. **不要**勾选 “Add a README file”、“Add .gitignore”、“Choose a license”——保持空仓库，否则初始化提交会和后面的文件冲突。
 6. 点击绿色 **Create repository**。
 
