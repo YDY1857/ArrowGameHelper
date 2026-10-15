@@ -100,7 +100,8 @@ static NSString *probeWebView(UIView *root) {
 
     // WKWebView is a UIView subclass; find the first WKWebView in the hierarchy.
     __block WKWebView *webView = nil;
-    void (^findWK)(UIView *) = ^(UIView *v) {
+    // __block is required for a recursive block (it captures itself).
+    __block void (^findWK)(UIView *) = ^(UIView *v) {
         if (webView) return;
         if ([v isKindOfClass:[WKWebView class]]) {
             webView = (WKWebView *)v;
