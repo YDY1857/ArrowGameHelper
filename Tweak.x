@@ -60,13 +60,6 @@ static CGRect loadBoardRect(void) {
     return [UIScreen mainScreen].bounds;
 }
 
-// Save current board from detected views (placeholder for automatic mode).
-static void saveDetectedGrid(NSArray<NSArray<NSNumber *> *> *grid) {
-    NSMutableDictionary *prefs = [NSMutableDictionary dictionaryWithContentsOfFile:PREF_PATH] ?: [NSMutableDictionary dictionary];
-    prefs[@"grid"] = grid;
-    [prefs writeToFile:PREF_PATH atomically:YES];
-}
-
 // Create a marker view showing a number at a given screen position.
 static UIView *makeMarker(NSString *text, CGPoint center) {
     UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 30, 30)];
