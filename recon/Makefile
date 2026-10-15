@@ -5,5 +5,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = ArrowGameRecon
 ArrowGameRecon_FILES = Tweak.x
 ArrowGameRecon_CFLAGS = -fobjc-arc -Wno-error=deprecated-declarations
+ArrowGameRecon_EXTRA_FRAMEWORKS = WebKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk

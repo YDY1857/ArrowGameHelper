@@ -1,7 +1,12 @@
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 
 #define RECON_PATH @"/var/mobile/arrowgame_recon.txt"
+
+// Forward declarations (definitions appear further below)
+static void showReconOverlay(NSString *text);
+static void hideReconOverlay(void);
 
 static UIWindow *gReconWindow = nil;
 static UITextView *gReconTextView = nil;
@@ -93,48 +98,23 @@ static NSString *dumpRelevantClasses(void) {
 static NSString *probeWebView(UIView *root) {
     __block NSMutableString *result = [NSMutableString stringWithString:@""];
 
-    // WKWebView is not a UIView subclass, so find it via its embedded scrollView.
-    // We search for WKScrollView / WKContentView in the hierarchy.
-    __block UIView *wkScrollView = nil;
+    // WKWebView is a UIView subclass; find the first WKWebView in the hierarchy.
+    __block WKWebView *webView = nil;
     void (^findWK)(UIView *) = ^(UIView *v) {
-        if (wkScrollView) return;
-        NSString *cls = NSStringFromClass([v class]);
-        if ([cls containsString:@"WKScrollView"] || [cls containsString:@"WKContentView"]) {
-            wkScrollView = v;
+        if (webView) return;
+        if ([v isKindOfClass:[WKWebView class]]) {
+            webView = (WKWebView *)v;
+            return;
         }
         for (UIView *sub in v.subviews) findWK(sub);
     };
     findWK(root);
 
-    if (!wkScrollView) {
+    if (!webView) {
         return @"\n=== WebView probe ===\nNo WKWebView detected (game is likely native or canvas).\n";
     }
 
     [result appendString:@"\n=== WebView probe ===\nDetected WKWebView surface.\n"];
-
-    // Try to reach the WKWebView object via the scrollView's delegate chain is not reliable;
-    // instead evaluate JS through any WKWebView we can find by walking the responder chain.
-    // Fallback: dump the nearest WKWebView by searching superviews for WKWebView.
-    UIView *candidate = wkScrollView;
-    id webView = nil;
-    while (candidate) {
-        if ([NSStringFromClass([candidate class]) isEqualToString:@"WKWebView"]) {
-            webView = candidate;
-            break;
-        }
-        // The scrollView is a subview of WKWebView, so check candidate.superview
-        UIView *sup = candidate.superview;
-        if (sup && [NSStringFromClass([sup class]) isEqualToString:@"WKWebView"]) {
-            webView = sup;
-            break;
-        }
-        candidate = candidate.superview;
-    }
-
-    if (!webView) {
-        [result appendString:@"Found WKScrollView but could not resolve WKWebView object.\n"];
-        return result;
-    }
 
     NSArray *jsProbes = @[
         @"typeof window!=='undefined'?Object.keys(window).filter(function(k){return /game|level|arrow|grid|puzzle|stage|board/i.test(k)}).join(','):'no-window'",
