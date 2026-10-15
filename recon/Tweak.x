@@ -95,21 +95,23 @@ static NSString *dumpRelevantClasses(void) {
 
 #pragma mark - WKWebView JS probe
 
+// Recursive helper as a plain C function (a recursive block would trigger
+// -Wuninitialized without __block and -Warc-retain-cycles with it).
+static WKWebView *findWKWebView(UIView *v) {
+    if (!v) return nil;
+    if ([v isKindOfClass:[WKWebView class]]) return (WKWebView *)v;
+    for (UIView *sub in v.subviews) {
+        WKWebView *found = findWKWebView(sub);
+        if (found) return found;
+    }
+    return nil;
+}
+
 static NSString *probeWebView(UIView *root) {
     __block NSMutableString *result = [NSMutableString stringWithString:@""];
 
     // WKWebView is a UIView subclass; find the first WKWebView in the hierarchy.
-    __block WKWebView *webView = nil;
-    // __block is required for a recursive block (it captures itself).
-    __block void (^findWK)(UIView *) = ^(UIView *v) {
-        if (webView) return;
-        if ([v isKindOfClass:[WKWebView class]]) {
-            webView = (WKWebView *)v;
-            return;
-        }
-        for (UIView *sub in v.subviews) findWK(sub);
-    };
-    findWK(root);
+    WKWebView *webView = findWKWebView(root);
 
     if (!webView) {
         return @"\n=== WebView probe ===\nNo WKWebView detected (game is likely native or canvas).\n";
