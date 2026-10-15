@@ -1,0 +1,62 @@
+name: Build ArrowGameHelper Tweak
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew install ldid dpkg fakeroot make
+          echo "$(brew --prefix)/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Set up Theos
+        run: |
+          set -e
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+          SDK_VER=iPhoneOS16.5.sdk
+          if curl -fSL -o /tmp/sdk.tar.xz "https://github.com/theos/sdks/raw/master/${SDK_VER}.tar.xz"; then
+            echo "Using official SDK tarball"
+            tar -xvf /tmp/sdk.tar.xz -C "$THEOS/sdks"
+          else
+            echo "Tarball failed, falling back to sparse-clone"
+            git clone --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+            (cd /tmp/sdks && git sparse-checkout set "$SDK_VER")
+            cp -R "/tmp/sdks/$SDK_VER" "$THEOS/sdks/"
+          fi
+          ls -la "$THEOS/sdks"
+
+      - name: Build & package (solver)
+        run: make package FINALPACKAGE=1
+
+      - name: Build & package (recon)
+        run: cd recon && make package FINALPACKAGE=1
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArrowGameHelper-${{ github.run_number }}
+          path: |
+            packages/*.deb
+            recon/packages/*.deb
+          if-no-files-found: error
+
+      - name: Attach to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packages/*.deb
+            recon/packages/*.deb
