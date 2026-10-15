@@ -23,9 +23,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential fakeroot rsync curl perl zip git libxml2 xz-utils ldid
+            build-essential fakeroot rsync curl perl zip git libxml2 xz-utils
           # Theos 官方安装脚本在 Linux 上会切换到 fakeroot-sysv 后端
           sudo update-alternatives --set fakeroot /usr/bin/fakeroot-sysv || true
+
+      - name: Install ldid (not available in Ubuntu apt repos)
+        run: |
+          ARCH=$(uname -m)   # x86_64
+          sudo curl -fsSL -o /usr/local/bin/ldid \
+            "https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_${ARCH}"
+          sudo chmod +x /usr/local/bin/ldid
+          ldid -v || true
 
       - name: Set up Theos
         run: |
