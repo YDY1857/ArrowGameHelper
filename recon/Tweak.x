@@ -6,6 +6,35 @@
 static UIWindow *gReconWindow = nil;
 static UITextView *gReconTextView = nil;
 
+// iOS 13+: keyWindow is deprecated; use the scene API instead.
+// Falls back to a runtime keyWindow call on older systems (no compile-time deprecation).
+static UIWindow *getMainWindow(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    NSSet<UIScene *> *scenes = app.connectedScenes;
+    for (UIScene *scene in scenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            UIWindow *found = nil;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) { found = w; break; }
+            }
+            if (!found) found = ws.windows.firstObject;
+            if (found) return found;
+        }
+    }
+    SEL kw = NSSelectorFromString(@"keyWindow");
+    if ([app respondsToSelector:kw]) {
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:[app methodSignatureForSelector:kw]];
+        inv.target = app;
+        inv.selector = kw;
+        [inv invoke];
+        __unsafe_unretained UIWindow *win = nil;
+        [inv getReturnValue:&win];
+        return win;
+    }
+    return nil;
+}
+
 #pragma mark - View hierarchy dump
 
 static NSInteger gNodeCount = 0;
@@ -174,11 +203,7 @@ static void runRecon(void) {
     [report appendFormat:@"ArrowGameRecon report @ %@\n", [NSDate date]];
     [report appendFormat:@"App bundle: %@\n", [NSBundle mainBundle].bundleIdentifier];
 
-    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
-    if (!keyWin) {
-        NSArray *wins = [UIApplication sharedApplication].windows;
-        keyWin = wins.firstObject;
-    }
+    UIWindow *keyWin = getMainWindow();
 
     gNodeCount = 0;
     [report appendString:@"\n=== View hierarchy (keyWindow) ===\n"];
@@ -221,7 +246,7 @@ static void runRecon(void) {
 static void showReconOverlay(NSString *text) {
     if (!gReconWindow) {
         gReconWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        gReconWindow.windowLevel = UIWindowLevelAlert + 200;
+        gReconWindow.windowLevel = 10000; // above alert (2000), avoids deprecated UIWindowLevelAlert
         gReconWindow.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.85];
     }
     if (!gReconTextView) {
