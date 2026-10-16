@@ -55,13 +55,29 @@ jobs:
       - name: Build & package (recon)
         run: cd recon && make package FINALPACKAGE=1
 
-      - name: Upload .deb artifacts
+      - name: Verify dylibs have no substrate dependency
+        run: |
+          NM="$THEOS/toolchain/linux/iphone/bin/llvm-nm"
+          DY=$(ls .theos/obj/*.dylib recon/.theos/obj/*.dylib 2>/dev/null || true)
+          echo "Built dylibs: $DY"
+          for f in $DY; do
+            echo "== $f =="
+            if "$NM" -u "$f" | grep -i -E "substrate|MSHook|logos" ; then
+              echo "WARNING: substrate symbols found in $f (would fail without a jailbreak runtime)"
+            else
+              echo "OK: no substrate symbols in $f"
+            fi
+          done
+
+      - name: Upload .deb + .dylib artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ArrowGameHelper-${{ github.run_number }}
           path: |
             packages/*.deb
             recon/packages/*.deb
+            .theos/obj/**/*.dylib
+            recon/.theos/obj/**/*.dylib
           if-no-files-found: error
 
       - name: Attach to Release
