@@ -28,6 +28,32 @@
 //     line up "user tapped here" against "this node changed".
 //     The panel hides itself while recording so it does not block play, and the
 //     RG ball turns orange to show recording is live.
+//
+// v6 changes (2026-10-16):
+//   [BUGFIX] The Cocos scene probe of v3..v5 NEVER RAN. evaluateJavaScript only
+//     ever executes in the web view's MAIN frame, so every `cc` reference
+//     resolved against the main frame's globals -- where there is none.
+//   [NEW] All probes now read the game iframe's window object directly
+//     (same-origin, proven by v5), via W.cc / W.my / W.MYGameGlobal.
+//   [NEW] "深度探针" button -> Documents/arrowgame_deep.txt
+//   [NEW] Per-sample game-frame heartbeat (scene / node count / viewport).
+//
+// v7 changes (2026-10-16):
+//   The v6 deep dump answered the architecture question, so v7 goes straight
+//   for the LEVEL DATA:
+//   [NEW] levelJS()  -- machine-readable level export (grid transform, all 165
+//     arrow polylines as flat cell lists, per-arrow active flag), plus
+//     self-validation run INSIDE the browser (index-convention check, cell
+//     coverage / overlap census, empty-cell list). A Python solver should be
+//     able to read this one block and nothing else.
+//   [NEW] compJS()   -- components deduped by class name, then every own
+//     property of one representative instance. v6 burned its entire 49-hit
+//     budget on 25 identical `isColorSwitch=false` rows, so the real state
+//     arrays were never reached; this fixes that.
+//   [NEW] Heartbeat now also reports snd=<soundIndex> arrows=<n> act=<active>,
+//     the two live signals that actually change during play.
+//   [CHORE] deepGameJS section D deduped by class.property and its cap raised
+//     48 -> 200.
 // ============================================================================
 
 static UIWindow *gReconWindow = nil;
@@ -46,7 +72,7 @@ static dispatch_queue_t gSampleQueue = nil;
 static const NSInteger kMaxSamples = 180;
 static const double kSampleInterval = 1.0;
 
-#define RECON_VERSION @"6"
+#define RECON_VERSION @"7"
 
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
@@ -342,7 +368,7 @@ static NSString *framesJS(void) {
     return @"(function(){var a=[];try{for(var i=0;i<window.length;i++){try{a.push(i+'='+String(frames[i].location.href).slice(0,180))}catch(e){a.push(i+'=<blocked>')}}}catch(e){}return a.length?a.join('\\n'):'(no frames)'})()";
 }
 
-#pragma mark - v6: reach INTO the game iframe
+#pragma mark - v6/v7: reach INTO the game iframe
 
 // Why v5 failed to dump the Cocos scene:
 //   -[WKWebView evaluateJavaScript:] ALWAYS runs in the web view's MAIN frame.
@@ -356,15 +382,7 @@ static NSString *framesJS(void) {
 // iframe's globals directly -- so we just hand the frame's window object to a
 // probe function and touch everything through it (W.cc, W.my, ...).
 // No eval() and no Function() are involved, so no CSP/unsafe-eval risk.
-static NSString *miniStateJS(void) {
-    return @"(function(){var W=null;try{W=frames[0]}catch(e){}if(!W)return 'noFrame';"
-           @"try{var cc=W.cc;if(!cc)return 'cc=<undef>';"
-           @"if(!cc.director||!cc.director.getScene)return 'cc-no-director';"
-           @"var sc=cc.director.getScene();if(!sc)return 'noScene';var n=0;"
-           @"(function w2(x,d){if(!x||d>9)return;n++;var c=x.children||[];for(var i=0;i<c.length;i++)w2(c[i],d+1)})(sc,0);"
-           @"return 'scene='+sc.name+' nodes='+n+' vp='+W.innerWidth+'x'+W.innerHeight}catch(e){return 'ERR '+e}})()";
-}
-
+//
 // Full introspective dump of the LIVE game state, read from inside the iframe.
 static NSString *deepGameJS(void) {
     return @"(function(){var out=[];"
@@ -407,14 +425,15 @@ static NSString *deepGameJS(void) {
     @"lines.push(new Array(d+1).join('  ')+nd.name+' ['+cs.join(',')+'] xy='+Math.round(p.x||0)+','+Math.round(p.y||0)+(nd.active===false?' OFF':''));"
     @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
     @"S(lines.join('\\n'))}"
-    @"S('--- D. data-bearing component props ---');"
-    @"var hits=0;"
-    @"if(sc){(function w2(nd,d){if(!nd||d>8||hits>48)return;var a=COMP(nd);"
-    @"for(var i=0;i<a.length;i++){var c=a[i];if(!c)continue;var ks=[];try{ks=Object.keys(c)}catch(e){}"
-    @"for(var j=0;j<ks.length;j++){var k=ks[j];if(k.charAt(0)==='_'||k.charAt(0)==='$')continue;var v;try{v=c[k]}catch(e){continue}"
+    @"S('--- D. data-bearing component props (deduped by class.prop) ---');"
+    @"var hits=0,seen={};"
+    @"if(sc){(function w2(nd,d){if(!nd||d>12||hits>200)return;var a=COMP(nd);"
+    @"for(var i=0;i<a.length;i++){var c=a[i];if(!c)continue;var cls=CN(c);var ks=[];try{ks=Object.keys(c)}catch(e){}"
+    @"for(var j=0;j<ks.length;j++){var k=ks[j];if(k.charAt(0)==='_'||k.charAt(0)==='$')continue;"
+    @"var dk=cls+'.'+k;if(seen[dk])continue;var v;try{v=c[k]}catch(e){continue}"
     @"if(v===null||v===undefined)continue;var tv=typeof v;"
-    @"if(tv==='object'&&typeof v.length==='number'&&v.length>=6){S('  @'+nd.name+' <'+CN(c)+'> .'+k+' len='+v.length+' = '+J(v,700));hits++}"
-    @"else if((tv==='number'||tv==='string'||tv==='boolean')&&/level|stage|round|cur|idx|index|dir|arrow|step|move|count|progress|score|board|grid|col|row/i.test(k)){S('  @'+nd.name+' <'+CN(c)+'> .'+k+' = '+J(v,90));hits++}}}"
+    @"if(tv==='object'&&typeof v.length==='number'&&v.length>=6){seen[dk]=1;S('  @'+nd.name+' <'+cls+'> .'+k+' len='+v.length+' = '+J(v,700));hits++}"
+    @"else if((tv==='number'||tv==='string'||tv==='boolean')&&/level|stage|round|cur|idx|index|dir|arrow|step|move|count|progress|score|board|grid|col|row/i.test(k)){seen[dk]=1;S('  @'+nd.name+' <'+cls+'> .'+k+' = '+J(v,90));hits++}}}"
     @"var ch=nd.children||[];for(var z=0;z<ch.length;z++)w2(ch[z],d+1)})(sc,0)}"
     @"S('  hits='+hits);"
     @"S('--- E. classes / bundles ---');"
@@ -432,6 +451,175 @@ static NSString *deepGameJS(void) {
     @"var s='';try{s=P(W)}catch(e){s='PROBE_ERR '+e}"
     @"S(s);"
     @"return out.join('\\n')})()";
+}
+
+// v7: the level data is now CONFIRMED -- 32 x 47 grid, 165 polyline "arrows"
+// that completely tile the 1504 cells (gridPointList.length === 32*47).
+// So the heartbeat additionally tracks the two live signals we found:
+//   soundIndex  -- increments on every successful move
+//   arrowNodeList length / active count -- which arrows are still on the board
+static NSString *miniStateJS(void) {
+    return @"(function(){var W=null;try{W=frames[0]}catch(e){}if(!W)return 'noFrame';"
+           @"try{var cc=W.cc;if(!cc)return 'cc=<undef>';"
+           @"if(!cc.director||!cc.director.getScene)return 'cc-no-director';"
+           @"var sc=cc.director.getScene();if(!sc)return 'noScene';var n=0;"
+           @"(function w2(x,d){if(!x||d>9)return;n++;var c=x.children||[];for(var i=0;i<c.length;i++)w2(c[i],d+1)})(sc,0);"
+           @"var ex='';"
+           @"try{var as=W.__reconAS;var cn=cc.js&&cc.js.getClassName;"
+           @"if(!as||as.isValid===false){as=null;"
+           @"(function w3(x,d){if(as||!x||d>14)return;var a=[];try{a=x._components||x.components||[]}catch(e){}"
+           @"for(var i=0;i<a.length;i++){var nm=null;try{nm=cn?cn(a[i]):null}catch(e){}if(nm==='ArrowSystem'){as=a[i];break}}"
+           @"var ch=x.children||[];for(var j=0;j<ch.length;j++)w3(ch[j],d+1)})(sc,0);W.__reconAS=as}"
+           @"if(as){var nl=as.arrowNodeList||[];var act=0,off=[];"
+           @"for(var i=0;i<nl.length;i++){try{var nd=nl[i];if(nd&&(nd.active===true||(nd.node&&nd.node.active===true)))act++;else off.push(i)}catch(e){}}"
+           @"ex=' snd='+as.soundIndex+' arrows='+nl.length+' act='+act+' off='+(off.length?off.join(','):'-')}}catch(e){ex=' stateErr'}"
+           @"return 'scene='+sc.name+' nodes='+n+' vp='+W.innerWidth+'x'+W.innerHeight+ex}catch(e){return 'ERR '+e}})()";
+}
+
+// Shared JS helper block, inlined verbatim into the v7 probes. Kept as literal
+// text rather than a #define on purpose: the offline static checker reads the
+// ObjC source, so a macro would make the helper functions invisible to it.
+//
+//   J(v,mx) -- JSON with a cap and a '[circ]' fallback
+//   K(x)    -- own+inherited enumerable key list
+//   SH(v)   -- one-line shallow summary of an arbitrary value (node-aware)
+
+// v7 probe #1 -- the whole LEVEL, machine-readable, plus self-validation.
+// Output design goal: a Python solver should be able to read this dump alone.
+static NSString *levelJS(void) {
+    return @"(function(){var out=[];"
+    @"function S(s){out.push(String(s))}"
+    @"var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W){return 'NO_IFRAME'}"
+    @"function P(W){"
+    @"var o=[];function S(s){o.push(String(s))}"
+    @"function J(v,mx){try{var s=JSON.stringify(v);if(s===undefined)s='[u]';if(mx&&s.length>mx)s=s.slice(0,mx)+'...';return s}catch(e){return '[circ]'}}"
+    @"function K(x){var a=[];try{for(var k in x)a.push(k)}catch(e){}return a}"
+    @"function SH(v,dp){try{dp=dp||0;if(v===null||v===undefined)return String(v);"
+    @"if(typeof v!=='object')return JSON.stringify(v);"
+    @"if(typeof v.length==='number'&&dp<2)return '['+v.length+']'+(v.length?(' '+SH(v[0],dp+1)):'');"
+    @"if(v.name!==undefined&&v.active!==undefined)return 'node['+v.name+',act='+(v.active?1:0)+',pos='+J(v.position,60)+']';"
+    @"var ks=[],k;for(k in v){if(k.charAt(0)==='_')continue;var t=typeof v[k];if(t==='function')continue;"
+    @"ks.push(k+'='+(t==='object'?'<'+t+'>':String(v[k]).slice(0,26)));if(ks.length>9)break}"
+    @"return '{'+ks.join(' ')+'}'}catch(e){return '<err>'}}"
+    @"var cc=W.cc;if(!cc){S('NO_CC');return o.join('\\n')}"
+    @"function CN(c){try{if(cc.js&&cc.js.getClassName){var n=cc.js.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
+    @"var sc=null;try{sc=cc.director.getScene()}catch(e){}"
+    @"if(!sc){S('NO_SCENE');return o.join('\\n')}"
+    @"var gs=null,as=null,gridNode=null;"
+    @"(function walk(nd,d){if(!nd||d>14)return;"
+    @"var a=[];try{a=nd._components||nd.components||[]}catch(e){}"
+    @"for(var i=0;i<a.length;i++){var nm=CN(a[i]);"
+    @"if(nm==='GridSystem'&&!gs){gs=a[i];gridNode=nd}"
+    @"else if(nm==='ArrowSystem'&&!as){as=a[i]}}"
+    @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
+    @"S('### META');"
+    @"try{S('ccVersion='+cc.ENGINE_VERSION)}catch(e){}"
+    @"try{S('winSize='+J(cc.winSize))}catch(e){}"
+    @"try{S('visibleSize='+J(cc.view.getVisibleSize()))}catch(e){}"
+    @"try{S('frameSize='+J(cc.view.getFrameSize()))}catch(e){}"
+    @"try{S('viewScaleX='+cc.view.getScaleX()+' viewScaleY='+cc.view.getScaleY())}catch(e){}"
+    @"try{S('devicePixelRatio='+W.devicePixelRatio+' sysPixelRatio='+(cc.sys&&cc.sys.pixelRatio)+' inner='+W.innerWidth+'x'+W.innerHeight)}catch(e){}"
+    @"S('### GRID NODE (world transform -> cell to screen mapping)');"
+    @"try{var wp=gridNode.getWorldPosition(),ws=gridNode.getWorldScale();"
+    @"S('name='+gridNode.name+' worldPos='+J(wp)+' worldScale='+J(ws)+' parent='+(gridNode.parent&&gridNode.parent.name)+' children='+((gridNode.children||[]).length))}catch(e){S('gridNodeErr '+e)}"
+    @"if(!gs){S('### NO_GridSystem')}else{"
+    @"var gw=gs.gridWidth,gh=gs.gridHeight;"
+    @"S('### GRID w='+gw+' h='+gh+' showGridNumber='+gs.showGridNumber);"
+    @"S('gridOwnProps='+K(gs).join(','));"
+    @"try{var gp=gs.gridPositions;"
+    @"S('gridPositions rows='+gp.length+' cols='+gp[0].length);"
+    @"S('gp[0][0]='+J(gp[0][0])+' gp[0][1]='+J(gp[0][1])+' gp[0][last]='+J(gp[0][gw-1]));"
+    @"S('gp[1][0]='+J(gp[1]?gp[1][0]:null)+' gp[last][0]='+J(gp[gh-1]?gp[gh-1][0]:null)+' gp[last][last]='+J(gp[gh-1]?gp[gh-1][gw-1]:null));"
+    @"S('gp[2][0]='+J(gp[2]?gp[2][0]:null)+' gp[3][0]='+J(gp[3]?gp[3][0]:null))}catch(e){S('gridPositionsErr '+e)}"
+    @"try{var gpl=gs.gridPointList;S('gridPointList len='+gpl.length+' [0]='+SH(gpl[0])+' [1]='+SH(gpl[1])+' [32]='+SH(gpl[32])+' [1503]='+SH(gpl[1503]))}catch(e){S('gridPointListErr '+e)}"
+    @"try{var gpts=gs.gridPoints;S('gridPoints len='+gpts.length+' [0]='+SH(gpts[0])+' [1]='+SH(gpts[1]))}catch(e){S('gridPointsErr '+e)}"
+    @"}"
+    @"if(!as){S('### NO_ArrowSystem');return o.join('\\n')}"
+    @"var aal=as.arrowAllPointList,apl=as.arrowPointList,anl=as.arrowNodeList;"
+    @"var n=aal?aal.length:0;"
+    @"S('### ARROW SYSTEM');"
+    @"S('arrowOwnProps='+K(as).join(','));"
+    @"S('lens: arrowPointList='+(apl?apl.length:-1)+' arrowAllPointList='+n+' arrowNodeList='+(anl?anl.length:-1)+' soundIndex='+as.soundIndex);"
+    @"var okA=0,badA=0,okB=0,badB=0;"
+    @"for(var i=0;i<n;i++){var cs=aal[i];if(!cs||cs.length<2)continue;var a1=true,a2=true;"
+    @"for(var k=1;k<cs.length;k++){var d=cs[k]-cs[k-1];if(Math.abs(d)!==1&&Math.abs(d)!==gw)a1=false;if(Math.abs(d)!==1&&Math.abs(d)!==gh)a2=false}"
+    @"if(a1)okA++;else badA++;if(a2)okB++;else badB++}"
+    @"S('INDEX_CONVENTION  row*gw+col: ok='+okA+' bad='+badA+'   |   col*gh+row: ok='+okB+' bad='+badB);"
+    @"var own={},tot=0,dup=0,uniq=0,dupS=[];"
+    @"for(var i=0;i<n;i++){var cs=aal[i]||[];for(var k=0;k<cs.length;k++){var id=cs[k];tot++;"
+    @"if(own[id]===undefined){own[id]=i;uniq++}else{dup++;if(dupS.length<10)dupS.push(id+'('+own[id]+','+i+')')}}}"
+    @"S('CELLS refs='+tot+' unique='+uniq+' overlaps='+dup+' gw*gh='+(gw*gh)+' dupSample='+dupS.join(' '));"
+    @"var i0,i1,i2,nx;var uniq2=[];for(var q=0;q<gw*gh;q++){if(own[q]===undefined)uniq2.push(q)}"
+    @"S('EMPTY_CELLS n='+uniq2.length+(uniq2.length?' first30='+uniq2.slice(0,30).join(','):''));"
+    @"S('sample arrowPointList[0..4]='+J(apl?apl.slice(0,5):null,400));"
+    @"S('### ARROW NODES (index active nodeName)');"
+    @"for(var i=0;i<(anl?anl.length:0)&&i<400;i++){var nd=null,act=-1,nm='?',pos='';"
+    @"try{nd=anl[i];if(nd){nm=nd.name;act=(nd.active===true||(nd.node&&nd.node.active===true))?1:0;pos=J(nd.position,60)}}catch(e){nm='<err>'}S('N'+i+' '+act+' '+nm+' '+pos)}"
+    @"S('### ARROWS '+n+'  format=<idx> <active> <nCells> <firstCell> <lastCell> <cell,cell,...>');"
+    @"for(var i=0;i<n&&i<400;i++){var cs=aal[i]||[];var act=1;"
+    @"try{var nd2=anl?anl[i]:null;if(nd2&&!(nd2.active===true||(nd2.node&&nd2.node.active===true)))act=0}catch(e){}"
+    @"S(i+' '+act+' '+cs.length+' '+(cs[0]===undefined?'-':cs[0])+' '+(cs.length?cs[cs.length-1]:'-')+' '+cs.join(','))}"
+    @"return o.join('\\n')}"
+    @"var s='';try{s=P(W)}catch(e){s='LEVEL_ERR '+e}"
+    @"S(s);return out.join('\\n')})()";
+}
+
+// v7 probe #2 -- dedup by component class name, then dump EVERY own property of
+// one representative instance. v6's section D burned its whole 49-hit budget on
+// 25 identical `isColorSwitch=false` rows, so the interesting state arrays were
+// never reached. This is the fix.
+static NSString *compJS(void) {
+    return @"(function(){var out=[];"
+    @"function S(s){out.push(String(s))}"
+    @"var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W){return 'NO_IFRAME'}"
+    @"function P(W){"
+    @"var o=[];function S(s){o.push(String(s))}"
+    @"function J(v,mx){try{var s=JSON.stringify(v);if(s===undefined)s='[u]';if(mx&&s.length>mx)s=s.slice(0,mx)+'...';return s}catch(e){return '[circ]'}}"
+    @"function K(x){var a=[];try{for(var k in x)a.push(k)}catch(e){}return a}"
+    @"function SH(v,dp){try{dp=dp||0;if(v===null||v===undefined)return String(v);"
+    @"if(typeof v!=='object')return JSON.stringify(v);"
+    @"if(typeof v.length==='number'&&dp<2)return '['+v.length+']'+(v.length?(' '+SH(v[0],dp+1)):'');"
+    @"if(v.name!==undefined&&v.active!==undefined)return 'node['+v.name+',act='+(v.active?1:0)+',pos='+J(v.position,60)+']';"
+    @"var ks=[],k;for(k in v){if(k.charAt(0)==='_')continue;var t=typeof v[k];if(t==='function')continue;"
+    @"ks.push(k+'='+(t==='object'?'<'+t+'>':String(v[k]).slice(0,26)));if(ks.length>9)break}"
+    @"return '{'+ks.join(' ')+'}'}catch(e){return '<err>'}}"
+    @"var cc=W.cc;if(!cc){S('NO_CC');return o.join('\\n')}"
+    @"function CN(c){try{if(cc.js&&cc.js.getClassName){var n=cc.js.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
+    @"var sc=null;try{sc=cc.director.getScene()}catch(e){}"
+    @"if(!sc){S('NO_SCENE');return o.join('\\n')}"
+    @"var skip={_components:1,_children:1,_parent:1,_node:1,__prefab:1,_objFlags:1,_eventProcessor:1,_enabled:1,node:1,enabled:1};"
+    @"var by={};"
+    @"(function walk(nd,d){if(!nd||d>14)return;var a=[];try{a=nd._components||nd.components||[]}catch(e){}"
+    @"for(var i=0;i<a.length;i++){var c=a[i];if(!c)continue;var nm=CN(c);"
+    @"if(!by[nm])by[nm]={n:0,f:c,node:nd.name,path:''};by[nm].n++}"
+    @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
+    @"var names=K(by);"
+    @"S('### COMPONENT CLASSES ('+names.length+')');"
+    @"for(var q=0;q<names.length;q++){var nm=names[q],e=by[nm],c=e.f;"
+    @"S('['+nm+'] x'+e.n+' onNode='+e.node);"
+    @"var ks=[];try{ks=Object.keys(c)}catch(err){}"
+    @"for(var i=0;i<ks.length;i++){var k=ks[i];if(skip[k])continue;"
+    @"var v=null;try{v=c[k]}catch(err){continue}"
+    @"if(v===null||v===undefined)continue;var t=typeof v;if(t==='function')continue;"
+    @"if(k.charAt(0)==='_'&&t!=='object')continue;"
+    @"if(t==='object'){"
+    @"if(typeof v.length==='number'){var head='';"
+    @"if(v.length){if(typeof v[0]==='object'){var sh=[];for(var z=0;z<3;z++)sh.push(SH(v[z]));head=' first3='+sh.join(' | ')}else head=' val='+J(v,240)}"
+    @"S('  .'+k+' array['+v.length+']'+head)}"
+    @"else{var kv=[],kk=K(v);for(var z2=0;z2<kk.length&&z2<20;z2++){var k2=kk[z2],v2;try{v2=v[k2]}catch(err){continue}"
+    @"var t2=typeof v2;if(t2==='function')continue;kv.push(k2+'='+(t2==='object'?'<obj>':String(v2).slice(0,26)))}"
+    @"S('  .'+k+' object{'+kv.join(' ')+'}')}}"
+    @"else S('  .'+k+' = '+J(v,140))}"
+    @"}"
+    @"return o.join('\\n')}"
+    @"var s='';try{s=P(W)}catch(e){s='COMP_ERR '+e}"
+    @"S(s);return out.join('\\n')})()";
 }
 
 // Higher score = more likely to be the game's JS host.
@@ -498,6 +686,8 @@ static NSString *probeAllWebViews(void) {
         if ((NSInteger)i == best) {
             [r appendFormat:@"state: %@\n", evalJS(w, miniStateJS(), 2.0)];
             [r appendFormat:@"DEEP:\n%@\n", evalJS(w, deepGameJS(), 5.0)];
+            [r appendFormat:@"LEVEL:\n%@\n", evalJS(w, levelJS(), 6.0)];
+            [r appendFormat:@"COMPONENTS:\n%@\n", evalJS(w, compJS(), 6.0)];
         }
     }
     return r;
