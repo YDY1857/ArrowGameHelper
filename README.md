@@ -164,21 +164,69 @@ git push -u origin main
 
 这一步是给**我**采集数据的，跑完把结果发我就行。
 
-1. 安装 `ArrowGameRecon` 的 deb，杀掉并重新打开支付宝。
-2. 进到箭头小游戏的关卡界面，确保箭头盘面已经完整显示。
-3. **三指同时轻点屏幕**触发侦察（不是三下，是三根手指一起点一下）。
-4. 屏幕会弹出一个黑底绿字的滚动文本框，显示视图层级摘要；同时完整报告已写入 `/var/mobile/arrowgame_recon.txt`。
-5. 用 Filza 打开这个 txt，全选复制，或者 AirDrop 传回电脑发给我。
-6. 再三指轻点一下可关闭文本框。
+1. 安装 `ArrowGameRecon`（越狱用 deb；非越狱见下面「非越狱注入」章节）。
+2. 杀掉并重新打开支付宝。
+3. 进到箭头小游戏的关卡界面，确保箭头盘面已经完整显示。
+4. **三指同时轻点屏幕**触发侦察（不是三下，是三根手指一起点一下）。
+5. 屏幕弹出黑底绿字面板，上面有两个按钮：
+   - **复制全部** → 报告进剪贴板，粘贴到备忘录/微信发我
+   - **分享 / 存文件** → 走系统分享，可发微信、AirDrop、或「存储到文件」
+6. 报告同时已写入文件（见下方路径）。
+7. 再三指轻点一下可关闭面板。
+
+**报告文件路径**（跟随运行环境自动选择）：
+
+- 非越狱 / 重签名 IPA：`<支付宝沙盒>/Documents/arrowgame_recon.txt`
+- 越狱：同样是 App 沙盒内的 `Documents`（用 Filza 进容器取）
 
 侦察报告包含四块：
 
 - `=== View hierarchy ===`：整个界面从 keyWindow 往下每一层 View 的类名和位置。用来判断游戏是原生 UIView、Cocos/Unity 的 GL 层、还是包在 WKWebView 里。
 - `=== Relevant Objective-C classes ===`：所有类名里带 `Arrow/Game/Level/Grid/Puzzle/Sprite/Node/Canvas/MiniApp/...` 的类，是后续 hook 的候选。
 - `=== WebView probe ===`：如果界面里有 WKWebView，会尝试 dump 出 JS 里跟 `game/level/arrow/grid` 相关的全局变量和页面文本。小程序游戏大多走这条路。
-- `=== Mini-program / game files ===`：支付宝容器里名字带 `game/arrow/miniapp/level/puzzle` 的文件路径，方便我们定位小程序的 JS 主包。
+- `=== Mini-program / game files ===`：App 沙盒里名字带 `game/arrow/miniapp/level/puzzle` 的文件路径，方便定位小程序 JS 主包。
 
-把这份报告发我之后，我就能判断该 hook 哪一层、数据从哪拿，然后给你升级求解版。
+把这份报告发我之后，我就能判断该 hook 哪一层、数据从哪拿，然后升级求解版。
+
+---
+
+## 非越狱 / 重签名 IPA 注入（个人证书方案）
+
+侦察版已改造为**不依赖 CydiaSubstrate**（纯 Objective-C runtime swizzling），因此可以注入到用个人证书重签名的支付宝 IPA 里。求解版将在阶段二一并改造。
+
+### 关键前提
+
+1. **不需要越狱**，但需要把 dylib 注入 IPA 并用你的证书重新签名。
+2. 报告写在 App 自己的沙盒里，**不要去读 `/var/mobile/`**（非越狱没权限）。
+3. ⚠️ 支付宝有安全风控 / 重签名检测，注入后可能报「环境异常」或闪退。先用侦察版实测，能进游戏就有戏。
+
+### 注入步骤（Windows）
+
+**方式一：Sideloadly（推荐，能直接注入 deb/dylib）**
+
+1. 下载安装 [Sideloadly](https://sideloadly.io)，装好 iTunes / iCloud 驱动。
+2. 把 `ArrowGameRecon_0.0.1_iphoneos-arm.deb`（或 CI 产出的 `ArrowGameRecon.dylib`）放进 `Sideloadly` 的 **Inject dylib/deb** 框。
+3. IPA 选原版支付宝 ipa，Apple ID 登录个人证书，开始签名安装。
+4. 装好后在 iPhone「设置 → 通用 → VPN与设备管理」信任证书。
+
+**方式二：轻松签 / ESign / Azule 等国内工具**
+
+1. 导入支付宝 ipa。
+2. 在「注入 dylib / 注入 deb」里加入侦察版 deb 或 dylib。
+3. 用自己的证书签名安装。
+
+### 让报告文件能在「文件」App 里看到（可选，最省事）
+
+重签名的 IPA 里，编辑 `Payload/AlipayWallet.app/Info.plist`，加上：
+
+```xml
+<key>UIFileSharingEnabled</key><true/>
+<key>LSSupportsOpeningDocumentsInPlace</key><true/>
+```
+
+装好后打开 iPhone 的「文件」App → 我的 iPhone → 支付宝 → 就能看到 `arrowgame_recon.txt`，直接拷贝出来。
+
+不加上面两行也行，用面板上的「复制全部 / 分享」按钮一样能拿到报告。
 
 ---
 
