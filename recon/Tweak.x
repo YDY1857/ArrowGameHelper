@@ -2,17 +2,38 @@
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 
-#define RECON_PATH @"/var/mobile/arrowgame_recon.txt"
-
-// Forward declarations (definitions appear further below)
-static void showReconOverlay(NSString *text);
-static void hideReconOverlay(void);
+// ============================================================================
+// ArrowGameRecon (non-jailbreak / re-signed IPA friendly version)
+//
+// - No Logos, no CydiaSubstrate: the hook is installed with the Objective-C
+//   runtime directly, so the dylib loads in a re-signed app with no jailbreak
+//   runtime present.
+// - The report is written into the app's OWN sandbox (Documents) — the only
+//   place a non-jailbroken app is allowed to write.
+// - Retrieval: on-screen overlay (screenshot), copy-to-clipboard, and a share
+//   sheet (WeChat / AirDrop / Save to Files).
+// ============================================================================
 
 static UIWindow *gReconWindow = nil;
 static UITextView *gReconTextView = nil;
 
-// iOS 13+: keyWindow is deprecated; use the scene API instead.
-// Falls back to a runtime keyWindow call on older systems (no compile-time deprecation).
+// Overlay controller (implementation is further below)
+@interface ReconOverlayController : NSObject
++ (instancetype)sharedInstance;
+- (void)presentWithText:(NSString *)text;
+- (void)hide;
+@end
+
+// ---------------------------------------------------------------------------
+// Sandbox-safe output path
+// ---------------------------------------------------------------------------
+static NSString *reconFilePath(void) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (!docs) docs = NSHomeDirectory();
+    return [docs stringByAppendingPathComponent:@"arrowgame_recon.txt"];
+}
+
+// iOS 13+: keyWindow is deprecated; use the scene API, fall back to runtime call.
 static UIWindow *getMainWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
     NSSet<UIScene *> *scenes = app.connectedScenes;
@@ -95,8 +116,7 @@ static NSString *dumpRelevantClasses(void) {
 
 #pragma mark - WKWebView JS probe
 
-// Recursive helper as a plain C function (a recursive block would trigger
-// -Wuninitialized without __block and -Warc-retain-cycles with it).
+// Plain recursive function (a recursive block would trip -Werror warnings).
 static WKWebView *findWKWebView(UIView *v) {
     if (!v) return nil;
     if ([v isKindOfClass:[WKWebView class]]) return (WKWebView *)v;
@@ -107,11 +127,8 @@ static WKWebView *findWKWebView(UIView *v) {
     return nil;
 }
 
-static NSString *probeWebView(UIView *root) {
-    __block NSMutableString *result = [NSMutableString stringWithString:@""];
-
-    // WKWebView is a UIView subclass; find the first WKWebView in the hierarchy.
-    WKWebView *webView = findWKWebView(root);
+static NSString *probeWebView(WKWebView *webView) {
+    NSMutableString *result = [NSMutableString stringWithString:@""];
 
     if (!webView) {
         return @"\n=== WebView probe ===\nNo WKWebView detected (game is likely native or canvas).\n";
@@ -142,7 +159,7 @@ static NSString *probeWebView(UIView *root) {
     return result;
 }
 
-#pragma mark - Filesystem scan
+#pragma mark - Filesystem scan (inside the app sandbox)
 
 static NSString *scanMiniProgramFiles(void) {
     NSMutableString *outStr = [NSMutableString stringWithString:@"\n=== Mini-program / game files ===\n"];
@@ -167,7 +184,7 @@ static NSString *scanMiniProgramFiles(void) {
             if (match && ([lower containsString:@"game"] || [lower containsString:@"arrow"] ||
                          [lower containsString:@"miniapp"] || [lower containsString:@"tinyapp"] ||
                          [lower containsString:@"level"] || [lower containsString:@"puzzle"] ||
-                         [exts containsObject:@"wasm"] || [lower hasSuffix:@".game"])) {
+                         [lower hasSuffix:@".game"])) {
                 [outStr appendFormat:@"%@/%@\n", dir, file];
                 found++;
             }
@@ -180,8 +197,7 @@ static NSString *scanMiniProgramFiles(void) {
 #pragma mark - Run recon
 
 static void runRecon(void) {
-    // sendEvent runs on the main thread, so capture UI data synchronously here
-    // (reading the view tree off the main thread is unsafe in UIKit).
+    // Called on the main thread (swizzled sendEvent), so capture UI synchronously.
     NSMutableString *report = [NSMutableString string];
     [report appendFormat:@"ArrowGameRecon report @ %@\n", [NSDate date]];
     [report appendFormat:@"App bundle: %@\n", [NSBundle mainBundle].bundleIdentifier];
@@ -196,93 +212,147 @@ static void runRecon(void) {
         [report appendString:@"No key window found.\n"];
     }
 
-    // Heavy / async-JS work goes to a background queue.
+    // Resolve the WKWebView on the main thread (view traversal off-main is unsafe).
+    WKWebView *webView = keyWin ? findWKWebView(keyWin) : nil;
+
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSString *classes = dumpRelevantClasses();
-        [report appendString:classes];
+        [report appendString:dumpRelevantClasses()];
+        [report appendString:probeWebView(webView)];
+        [report appendString:scanMiniProgramFiles()];
 
-        if (keyWin) {
-            NSString *web = probeWebView(keyWin);
-            [report appendString:web];
-        }
-
-        NSString *files = scanMiniProgramFiles();
-        [report appendString:files];
-
+        NSString *path = reconFilePath();
         NSError *err = nil;
-        [report writeToFile:RECON_PATH atomically:YES encoding:NSUTF8StringEncoding error:&err];
+        [report writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
         if (err) {
             NSLog(@"[ArrowGameRecon] write error: %@", err);
         } else {
-            NSLog(@"[ArrowGameRecon] report written to %@", RECON_PATH);
+            NSLog(@"[ArrowGameRecon] report written to %@", path);
         }
 
-        // Show summary overlay back on the main thread.
         dispatch_async(dispatch_get_main_queue(), ^{
-            showReconOverlay(report);
+            [[ReconOverlayController sharedInstance] presentWithText:report];
         });
     });
 }
 
-#pragma mark - Overlay
+#pragma mark - Overlay + retrieval controller
 
-static void showReconOverlay(NSString *text) {
+@implementation ReconOverlayController
+
++ (instancetype)sharedInstance {
+    static ReconOverlayController *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ inst = [[ReconOverlayController alloc] init]; });
+    return inst;
+}
+
+- (void)presentWithText:(NSString *)text {
     if (!gReconWindow) {
         gReconWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        gReconWindow.windowLevel = 10000; // above alert (2000), avoids deprecated UIWindowLevelAlert
-        gReconWindow.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.85];
-    }
-    if (!gReconTextView) {
-        gReconTextView = [[UITextView alloc] initWithFrame:CGRectInset(gReconWindow.bounds, 20, 60)];
-        gReconTextView.editable = NO;
-        gReconTextView.font = [UIFont fontWithName:@"Menlo" size:10];
-        gReconTextView.textColor = [UIColor greenColor];
-        gReconTextView.backgroundColor = [UIColor blackColor];
-        [gReconWindow addSubview:gReconTextView];
+        gReconWindow.windowLevel = 10000; // above alert (2000)
+        gReconWindow.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.92];
+        UIViewController *root = [[UIViewController alloc] init];
+        root.view.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.92];
+        gReconWindow.rootViewController = root;
 
-        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 20, gReconWindow.bounds.size.width, 30)];
-        hint.text = @"ArrowGameRecon - 3指轻点关闭 / 截图发给我";
+        CGFloat w = gReconWindow.bounds.size.width;
+        CGFloat h = gReconWindow.bounds.size.height;
+
+        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 44, w, 22)];
+        hint.text = @"ArrowGameRecon · 三指轻点关闭";
         hint.textColor = [UIColor whiteColor];
         hint.textAlignment = NSTextAlignmentCenter;
         hint.font = [UIFont boldSystemFontOfSize:13];
-        [gReconWindow addSubview:hint];
+        [root.view addSubview:hint];
+
+        UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        copyBtn.frame = CGRectMake(20, 74, (w - 60) / 2, 34);
+        [copyBtn setTitle:@"复制全部" forState:UIControlStateNormal];
+        [copyBtn addTarget:self action:@selector(btnCopy) forControlEvents:UIControlEventTouchUpInside];
+        [root.view addSubview:copyBtn];
+
+        UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        shareBtn.frame = CGRectMake(40 + (w - 60) / 2, 74, (w - 60) / 2, 34);
+        [shareBtn setTitle:@"分享 / 存文件" forState:UIControlStateNormal];
+        [shareBtn addTarget:self action:@selector(btnShare) forControlEvents:UIControlEventTouchUpInside];
+        [root.view addSubview:shareBtn];
+
+        gReconTextView = [[UITextView alloc] initWithFrame:CGRectMake(12, 118, w - 24, h - 140)];
+        gReconTextView.editable = NO;
+        gReconTextView.font = [UIFont fontWithName:@"Menlo" size:9];
+        gReconTextView.textColor = [UIColor greenColor];
+        gReconTextView.backgroundColor = [UIColor blackColor];
+        [root.view addSubview:gReconTextView];
     }
     gReconTextView.text = text;
     gReconWindow.hidden = NO;
 }
 
-static void hideReconOverlay(void) {
+- (void)hide {
     gReconWindow.hidden = YES;
 }
 
-#pragma mark - Trigger
-
-%hook UIApplication
-
-- (void)sendEvent:(UIEvent *)event {
-    %orig;
-    if (event.type == UIEventTypeTouches) {
-        NSSet *touches = event.allTouches;
-        if (touches.count == 3) {
-            BOOL allThreeFingerTap = YES;
-            for (UITouch *t in touches) {
-                if (t.tapCount != 1 || t.phase != UITouchPhaseEnded) {
-                    allThreeFingerTap = NO;
-                }
-            }
-            if (allThreeFingerTap) {
-                if (gReconWindow && !gReconWindow.hidden) {
-                    hideReconOverlay();
-                } else {
-                    runRecon();
-                }
-            }
-        }
+- (void)btnCopy {
+    if (gReconTextView.text.length) {
+        [UIPasteboard generalPasteboard].string = gReconTextView.text;
     }
 }
 
-%end
+- (void)btnShare {
+    NSString *path = reconFilePath();
+    UIViewController *presenter = [getMainWindow() rootViewController] ?: gReconWindow.rootViewController;
+    if (!presenter) return;
+    UIActivityViewController *avc = nil;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        avc = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                                applicationActivities:nil];
+    } else {
+        avc = [[UIActivityViewController alloc] initWithActivityItems:@[gReconTextView.text ?: @""]
+                                                applicationActivities:nil];
+    }
+    avc.popoverPresentationController.sourceView = gReconWindow;
+    [presenter presentViewController:avc animated:YES completion:nil];
+}
 
-%ctor {
-    NSLog(@"[ArrowGameRecon] loaded into Alipay");
+@end
+
+static void hideReconOverlay(void) {
+    [[ReconOverlayController sharedInstance] hide];
+}
+
+#pragma mark - Hook via Objective-C runtime (no substrate)
+
+static IMP gOrigSendEvent = NULL;
+
+static void reconSendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
+    if (gOrigSendEvent) {
+        ((void (*)(id, SEL, id))gOrigSendEvent)(self, _cmd, event);
+    }
+    if (event.type != UIEventTypeTouches) return;
+    NSSet *touches = event.allTouches;
+    if (touches.count != 3) return;
+    BOOL allThreeFingerTap = YES;
+    for (UITouch *t in touches) {
+        if (t.tapCount != 1 || t.phase != UITouchPhaseEnded) allThreeFingerTap = NO;
+    }
+    if (!allThreeFingerTap) return;
+
+    if (gReconWindow && !gReconWindow.hidden) {
+        hideReconOverlay();
+    } else {
+        runRecon();
+    }
+}
+
+__attribute__((constructor))
+static void ArrowGameReconInit(void) {
+    Class cls = [UIApplication class];
+    Method m = class_getInstanceMethod(cls, sel_registerName("sendEvent:"));
+    if (m) {
+        gOrigSendEvent = method_getImplementation(m);
+        method_setImplementation(m, (IMP)reconSendEvent);
+        NSLog(@"[ArrowGameRecon] sendEvent: hooked (no substrate)");
+    } else {
+        NSLog(@"[ArrowGameRecon] failed to find -[UIApplication sendEvent:]");
+    }
 }
