@@ -10,8 +10,19 @@
 //   runtime present.
 // - The report is written into the app's OWN sandbox (Documents) — the only
 //   place a non-jailbroken app is allowed to write.
-// - Retrieval: on-screen overlay (screenshot), copy-to-clipboard, and a share
-//   sheet (WeChat / AirDrop / Save to Files).
+//
+// v2 changes (2026-10-16) — fixes "panel popped up and the whole app went dead":
+//   1. The overlay windows are now ReconWindow (a UIWindow subclass whose
+//      -hitTest: returns nil for empty areas). Root cause of the freeze: a
+//      plain UIWindow answers -hitTest: with *itself* when no subview claims
+//      the point, so the PassthroughView trick never actually fired and every
+//      touch was swallowed by the overlay window.
+//   2. The panel is no longer full-screen: it is a card that leaves a
+//      transparent strip at the bottom, and it has an explicit 关闭 button.
+//   3. The 8s launch self-check no longer hijacks the screen — it runs
+//      silently (writes the file only) and shows a 2.5s non-blocking toast.
+//   4. The "三指轻点关闭" hint is gone (three-finger tap is unreliable).
+//      Panel exit: tap 关闭, or tap the RG ball.
 // ============================================================================
 
 static UIWindow *gReconWindow = nil;
@@ -25,6 +36,7 @@ static UIWindow *gBadgeWindow = nil;
 - (void)hide;
 // Floating badge: visible proof the dylib loaded + a reliable trigger.
 - (void)showBadge;
+- (void)showToast:(NSString *)msg;
 - (void)installThreeFingerLongPress;
 @end
 
@@ -40,6 +52,26 @@ static UIWindow *gBadgeWindow = nil;
 }
 @end
 
+// ---------------------------------------------------------------------------
+// The real fix for touch pass-through.
+//
+// A bare UIWindow returns *itself* from -hitTest: when no subview is hit, and a
+// touch delivered to a UIWindow goes nowhere — it does NOT continue down to the
+// windows below. Returning nil here is what lets an empty area of the overlay
+// reach the app underneath.
+// ---------------------------------------------------------------------------
+@interface ReconWindow : UIWindow
+@end
+
+@implementation ReconWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self) return nil;
+    if (hit && hit == self.rootViewController.view) return nil;
+    return hit;
+}
+@end
+
 // iOS 13+ rework: a UIWindow must be attached to the active UIWindowScene,
 // otherwise it is never shown in a scene-based app (like Alipay).
 static UIWindow *makeOverlayWindow(void) {
@@ -48,7 +80,7 @@ static UIWindow *makeOverlayWindow(void) {
         if ([s isKindOfClass:[UIWindowScene class]] &&
             s.activationState == UISceneActivationStateForegroundActive) {
             UIWindowScene *ws = (UIWindowScene *)s;
-            UIWindow *w = [[UIWindow alloc] initWithWindowScene:ws];
+            ReconWindow *w = [[ReconWindow alloc] initWithWindowScene:ws];
             w.frame = ws.coordinateSpace.bounds;
             return w;
         }
@@ -57,12 +89,12 @@ static UIWindow *makeOverlayWindow(void) {
     for (UIScene *s in app.connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]]) {
             UIWindowScene *ws = (UIWindowScene *)s;
-            UIWindow *w = [[UIWindow alloc] initWithWindowScene:ws];
+            ReconWindow *w = [[ReconWindow alloc] initWithWindowScene:ws];
             w.frame = ws.coordinateSpace.bounds;
             return w;
         }
     }
-    return [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    return [[ReconWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +200,16 @@ static WKWebView *findWKWebView(UIView *v) {
     return nil;
 }
 
+// dispatch_sync onto the main queue DEADLOCKS if we are already on it. Always
+// go through this helper so probeWebView can never hang the app.
+static void runOnMainSync(dispatch_block_t block) {
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+}
+
 static NSString *probeWebView(WKWebView *webView) {
     NSMutableString *result = [NSMutableString stringWithString:@""];
 
@@ -187,7 +229,7 @@ static NSString *probeWebView(WKWebView *webView) {
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         __block NSString *val = nil;
         // WKWebView evaluateJavaScript must run on the main thread.
-        dispatch_sync(dispatch_get_main_queue(), ^{
+        runOnMainSync(^{
             [webView evaluateJavaScript:js completionHandler:^(id v, NSError *err) {
                 if (err) val = [@"ERR:" stringByAppendingString:err.localizedDescription];
                 else val = [v description];
@@ -236,12 +278,16 @@ static NSString *scanMiniProgramFiles(void) {
 }
 
 #pragma mark - Run recon
+//
+// showPanel == NO  -> silent run: write the file, show a short toast, no panel.
+// showPanel == YES -> show the report card on screen.
 
-static void runRecon(void) {
-    // Called on the main thread (swizzled sendEvent), so capture UI synchronously.
+static void runRecon(BOOL showPanel) {
+    // Called on the main thread, so capture UI synchronously.
     NSMutableString *report = [NSMutableString string];
     [report appendFormat:@"ArrowGameRecon report @ %@\n", [NSDate date]];
     [report appendFormat:@"App bundle: %@\n", [NSBundle mainBundle].bundleIdentifier];
+    [report appendFormat:@"Trigger: %@\n", showPanel ? @"manual (panel shown)" : @"launch self-check (silent)"];
 
     UIWindow *keyWin = getMainWindow();
 
@@ -271,7 +317,12 @@ static void runRecon(void) {
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            [[ReconOverlayController sharedInstance] presentWithText:report];
+            ReconOverlayController *c = [ReconOverlayController sharedInstance];
+            if (showPanel) {
+                [c presentWithText:report];
+            } else {
+                [c showToast:@"侦察完成（静默）：报告已写入 Documents/arrowgame_recon.txt"];
+            }
         });
     });
 }
@@ -291,51 +342,105 @@ static void runRecon(void) {
     if (!gReconWindow) {
         gReconWindow = makeOverlayWindow();
         gReconWindow.windowLevel = 10000; // above alert (2000)
-        gReconWindow.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.92];
+        gReconWindow.backgroundColor = [UIColor clearColor];
+
         UIViewController *root = [[UIViewController alloc] init];
-        root.view.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.92];
+        root.view = [[PassthroughView alloc] initWithFrame:gReconWindow.bounds];
+        root.view.backgroundColor = [UIColor clearColor];
+        root.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         gReconWindow.rootViewController = root;
 
-        CGFloat w = gReconWindow.bounds.size.width;
-        CGFloat h = gReconWindow.bounds.size.height;
+        CGFloat w = root.view.bounds.size.width;
+        CGFloat h = root.view.bounds.size.height;
 
-        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 44, w, 22)];
-        hint.text = @"ArrowGameRecon · 三指轻点关闭";
-        hint.textColor = [UIColor whiteColor];
-        hint.textAlignment = NSTextAlignmentCenter;
-        hint.font = [UIFont boldSystemFontOfSize:13];
-        [root.view addSubview:hint];
+        // Card instead of full screen: the strip at the bottom stays see-through
+        // so you can see the app is still alive and reach it.
+        CGFloat cardX = 10.0, cardY = 46.0;
+        CGFloat cardW = w - 20.0, cardH = h - cardY - 96.0;
+        UIView *card = [[UIView alloc] initWithFrame:CGRectMake(cardX, cardY, cardW, cardH)];
+        card.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.95];
+        card.layer.cornerRadius = 14;
+        card.layer.masksToBounds = YES;
+        card.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [root.view addSubview:card];
+
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, cardW - 28, 20)];
+        title.text = @"ArrowGameRecon · 侦察报告";
+        title.textColor = [UIColor whiteColor];
+        title.font = [UIFont boldSystemFontOfSize:13];
+        title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [card addSubview:title];
+
+        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(14, 27, cardW - 28, 15)];
+        hint.text = @"退出：点「关闭」，或点屏幕上的 RG 小球。下半屏仍可正常操作 App";
+        hint.textColor = [UIColor colorWithWhite:0.68 alpha:1.0];
+        hint.font = [UIFont systemFontOfSize:10];
+        hint.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [card addSubview:hint];
+
+        // Three buttons: 关闭 / 复制全部 / 分享 / 存文件
+        CGFloat by = 46.0, bh = 32.0, gap = 6.0, pad = 8.0;
+        CGFloat bw = (cardW - pad * 2 - gap * 2) / 3.0;
+
+        UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        closeBtn.frame = CGRectMake(pad, by, bw, bh);
+        [closeBtn setTitle:@"关闭" forState:UIControlStateNormal];
+        [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        closeBtn.backgroundColor = [UIColor colorWithRed:0.72 green:0.20 blue:0.20 alpha:1.0];
+        closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        closeBtn.layer.cornerRadius = 7;
+        closeBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleRightMargin;
+        [closeBtn addTarget:self action:@selector(btnClose) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:closeBtn];
 
         UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        copyBtn.frame = CGRectMake(20, 74, (w - 60) / 2, 34);
+        copyBtn.frame = CGRectMake(pad + bw + gap, by, bw, bh);
         [copyBtn setTitle:@"复制全部" forState:UIControlStateNormal];
+        [copyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        copyBtn.backgroundColor = [UIColor colorWithRed:0.11 green:0.55 blue:0.40 alpha:1.0];
+        copyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        copyBtn.layer.cornerRadius = 7;
+        copyBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
         [copyBtn addTarget:self action:@selector(btnCopy) forControlEvents:UIControlEventTouchUpInside];
-        [root.view addSubview:copyBtn];
+        [card addSubview:copyBtn];
 
         UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        shareBtn.frame = CGRectMake(40 + (w - 60) / 2, 74, (w - 60) / 2, 34);
+        shareBtn.frame = CGRectMake(pad + (bw + gap) * 2, by, bw, bh);
         [shareBtn setTitle:@"分享 / 存文件" forState:UIControlStateNormal];
+        [shareBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        shareBtn.backgroundColor = [UIColor colorWithRed:0.30 green:0.34 blue:0.38 alpha:1.0];
+        shareBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        shareBtn.layer.cornerRadius = 7;
+        shareBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleLeftMargin;
         [shareBtn addTarget:self action:@selector(btnShare) forControlEvents:UIControlEventTouchUpInside];
-        [root.view addSubview:shareBtn];
+        [card addSubview:shareBtn];
 
-        gReconTextView = [[UITextView alloc] initWithFrame:CGRectMake(12, 118, w - 24, h - 140)];
+        CGFloat ty = by + bh + 8.0;
+        gReconTextView = [[UITextView alloc] initWithFrame:CGRectMake(pad, ty, cardW - pad * 2, cardH - ty - pad)];
         gReconTextView.editable = NO;
         gReconTextView.font = [UIFont fontWithName:@"Menlo" size:9];
-        gReconTextView.textColor = [UIColor greenColor];
+        gReconTextView.textColor = [UIColor colorWithRed:0.35 green:0.95 blue:0.45 alpha:1.0];
         gReconTextView.backgroundColor = [UIColor blackColor];
-        [root.view addSubview:gReconTextView];
+        gReconTextView.layer.cornerRadius = 6;
+        gReconTextView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [card addSubview:gReconTextView];
     }
     gReconTextView.text = text;
     gReconWindow.hidden = NO;
 }
 
 - (void)hide {
-    gReconWindow.hidden = YES;
+    if (gReconWindow) gReconWindow.hidden = YES;
+}
+
+- (void)btnClose {
+    [self hide];
 }
 
 - (void)btnCopy {
     if (gReconTextView.text.length) {
         [UIPasteboard generalPasteboard].string = gReconTextView.text;
+        [self showToast:@"已复制到剪贴板"];
     }
 }
 
@@ -357,46 +462,78 @@ static void runRecon(void) {
 
 #pragma mark - Floating badge (load proof + trigger)
 
+// MUST be called on the main thread.
+- (void)ensureBadgeOnMain {
+    if (!gBadgeWindow) {
+        CGFloat side = 46;
+        gBadgeWindow = makeOverlayWindow();
+        gBadgeWindow.windowLevel = 10001; // above the report card
+        gBadgeWindow.backgroundColor = [UIColor clearColor];
+        UIViewController *root = [[UIViewController alloc] init];
+        root.view = [[PassthroughView alloc] initWithFrame:gBadgeWindow.bounds];
+        root.view.backgroundColor = [UIColor clearColor];
+        root.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        gBadgeWindow.rootViewController = root;
+
+        CGSize sc = gBadgeWindow.bounds.size;
+        UILabel *badge = [[UILabel alloc] initWithFrame:CGRectMake(sc.width - side - 8, sc.height * 0.55, side, side)];
+        badge.text = @"RG";
+        badge.textAlignment = NSTextAlignmentCenter;
+        badge.font = [UIFont boldSystemFontOfSize:15];
+        badge.textColor = [UIColor whiteColor];
+        badge.backgroundColor = [UIColor colorWithRed:0.92 green:0.12 blue:0.12 alpha:0.78];
+        badge.layer.cornerRadius = side / 2;
+        badge.layer.masksToBounds = YES;
+        badge.userInteractionEnabled = YES;
+        badge.tag = 9001;
+        badge.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+        [root.view addSubview:badge];
+
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(badgeTapped)];
+        [badge addGestureRecognizer:tap];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(badgePanned:)];
+        [badge addGestureRecognizer:pan];
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+            [self installThreeFingerLongPress];
+        }];
+    }
+    gBadgeWindow.hidden = NO;
+    [self installThreeFingerLongPress];
+}
+
 - (void)showBadge {
+    dispatch_async(dispatch_get_main_queue(), ^{ [self ensureBadgeOnMain]; });
+}
+
+// Short, non-blocking confirmation banner. Never intercepts touches.
+- (void)showToast:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!gBadgeWindow) {
-            CGFloat side = 46;
-            gBadgeWindow = makeOverlayWindow();
-            gBadgeWindow.windowLevel = 10001;
-            gBadgeWindow.backgroundColor = [UIColor clearColor];
-            UIViewController *root = [[UIViewController alloc] init];
-            root.view = [[PassthroughView alloc] initWithFrame:gBadgeWindow.bounds];
-            root.view.backgroundColor = [UIColor clearColor];
-            root.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            gBadgeWindow.rootViewController = root;
-
-            CGSize sc = gBadgeWindow.bounds.size;
-            UILabel *badge = [[UILabel alloc] initWithFrame:CGRectMake(sc.width - side - 8, sc.height * 0.55, side, side)];
-            badge.text = @"RG";
-            badge.textAlignment = NSTextAlignmentCenter;
-            badge.font = [UIFont boldSystemFontOfSize:15];
-            badge.textColor = [UIColor whiteColor];
-            badge.backgroundColor = [UIColor colorWithRed:0.92 green:0.12 blue:0.12 alpha:0.78];
-            badge.layer.cornerRadius = side / 2;
-            badge.layer.masksToBounds = YES;
-            badge.userInteractionEnabled = YES;
-            badge.tag = 9001;
-            [root.view addSubview:badge];
-
-            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(badgeTapped)];
-            [badge addGestureRecognizer:tap];
-            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(badgePanned:)];
-            [badge addGestureRecognizer:pan];
-
-            [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                              object:nil
-                                                               queue:[NSOperationQueue mainQueue]
-                                                          usingBlock:^(NSNotification *note) {
-                [self installThreeFingerLongPress];
-            }];
-        }
-        gBadgeWindow.hidden = NO;
-        [self installThreeFingerLongPress];
+        [self ensureBadgeOnMain];
+        UIView *host = gBadgeWindow.rootViewController.view;
+        if (!host) return;
+        [[host viewWithTag:9002] removeFromSuperview];
+        CGFloat w = host.bounds.size.width;
+        UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(20, 54, w - 40, 36)];
+        toast.tag = 9002;
+        toast.text = msg;
+        toast.numberOfLines = 2;
+        toast.textAlignment = NSTextAlignmentCenter;
+        toast.font = [UIFont boldSystemFontOfSize:11];
+        toast.textColor = [UIColor whiteColor];
+        toast.backgroundColor = [UIColor colorWithRed:0.10 green:0.52 blue:0.36 alpha:0.93];
+        toast.layer.cornerRadius = 8;
+        toast.layer.masksToBounds = YES;
+        toast.userInteractionEnabled = NO;
+        toast.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [host addSubview:toast];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [toast removeFromSuperview];
+        });
     });
 }
 
@@ -404,7 +541,7 @@ static void runRecon(void) {
     if (gReconWindow && !gReconWindow.hidden) {
         [self hide];
     } else {
-        runRecon();
+        runRecon(YES);
     }
 }
 
@@ -434,7 +571,7 @@ static void runRecon(void) {
     if (gReconWindow && !gReconWindow.hidden) {
         [self hide];
     } else {
-        runRecon();
+        runRecon(YES);
     }
 }
 
@@ -461,10 +598,13 @@ static void reconSendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
     }
     if (!allThreeFingerTap) return;
 
+    // Three-finger tap is kept as a bonus trigger only — it is unreliable
+    // (three fingers rarely all sit in the Ended phase at the same instant),
+    // which is why the panel now has its own 关闭 button.
     if (gReconWindow && !gReconWindow.hidden) {
         hideReconOverlay();
     } else {
-        runRecon();
+        runRecon(YES);
     }
 }
 
@@ -484,7 +624,7 @@ static void ArrowGameReconInit(void) {
     // the floating badge (visible proof + tap-to-run).
     NSString *marker = [[reconFilePath() stringByDeletingLastPathComponent]
                         stringByAppendingPathComponent:@"_recon_loaded.txt"];
-    NSString *info = [NSString stringWithFormat:@"loaded @ %@\nbundle=%@\nhooked=%s\n",
+    NSString *info = [NSString stringWithFormat:@"loaded @ %@\nbundle=%@\nhooked=%s\nversion=2\n",
                       [NSDate date], [NSBundle mainBundle].bundleIdentifier, m ? "yes" : "no"];
     [info writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 
@@ -493,13 +633,14 @@ static void ArrowGameReconInit(void) {
         [[ReconOverlayController sharedInstance] showBadge];
     });
 
-    // One-shot auto run ~8s after launch: if a report panel appears on its own,
-    // the whole chain (load + hook + window) is proven working.
+    // Launch self-check ~8s after start. SILENT: it only writes the report and
+    // shows a short toast — it must NOT steal the screen while you are using
+    // the app or navigating into the mini-program.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         static BOOL ran = NO;
         if (ran) return;
         ran = YES;
-        runRecon();
+        runRecon(NO);
     });
 }
