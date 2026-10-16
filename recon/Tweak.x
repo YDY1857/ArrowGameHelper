@@ -472,7 +472,11 @@ static NSString *miniStateJS(void) {
            @"var ch=x.children||[];for(var j=0;j<ch.length;j++)w3(ch[j],d+1)})(sc,0);W.__reconAS=as}"
            @"if(as){var nl=as.arrowNodeList||[];var act=0,off=[];"
            @"for(var i=0;i<nl.length;i++){try{var nd=nl[i];if(nd&&(nd.active===true||(nd.node&&nd.node.active===true)))act++;else off.push(i)}catch(e){}}"
-           @"ex=' snd='+as.soundIndex+' arrows='+nl.length+' act='+act+' off='+(off.length?off.join(','):'-')}}catch(e){ex=' stateErr'}"
+           @"var all=as.arrowAllPointList||[];var h1=0,h2=0;"
+           @"for(var q=0;q<all.length;q++){var cs=all[q]||[];h1=(h1+(q+1)*cs.length)%1000003;h2=(h2+((cs[0]||0)+1)*(q+7))%1000003}"
+           @"ex=' snd='+as.soundIndex+' arrows='+nl.length+' act='+act"
+           @"+' off='+(off.length?off.join(','):'-')"
+           @"+' sig='+all.length+'/'+h1+'/'+h2}}catch(e){ex=' stateErr'}"
            @"return 'scene='+sc.name+' nodes='+n+' vp='+W.innerWidth+'x'+W.innerHeight+ex}catch(e){return 'ERR '+e}})()";
 }
 
