@@ -442,11 +442,11 @@ static NSString *buildTextDump(void) {
     }
 
     NSString *summary = [NSString stringWithFormat:
-        "===== ArrowGameRecon H5 text dump =====\n"
-        "version: %@\ndate: %@\n"
-        "included files: %ld\ntotal bytes: %llu (cap 12 MB)\n"
-        "skipped (extension): %ld\nskipped (>2MB): %ld\nskipped (binary): %ld\n"
-        "Tip: search this file for 'arrow', 'level', 'direction', 'grid', 'config'.\n",
+        @"===== ArrowGameRecon H5 text dump =====\n"
+        @"version: %@\ndate: %@\n"
+        @"included files: %ld\ntotal bytes: %llu (cap 12 MB)\n"
+        @"skipped (extension): %ld\nskipped (>2MB): %ld\nskipped (binary): %ld\n"
+        @"Tip: search this file for 'arrow', 'level', 'direction', 'grid', 'config'.\n",
         RECON_VERSION, [NSDate date], (long)taken, total,
         (long)skippedExt, (long)skippedBig, (long)skippedBin];
     [fh writeData:[summary dataUsingEncoding:NSUTF8StringEncoding]];
