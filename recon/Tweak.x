@@ -46,7 +46,7 @@ static dispatch_queue_t gSampleQueue = nil;
 static const NSInteger kMaxSamples = 180;
 static const double kSampleInterval = 1.0;
 
-#define RECON_VERSION @"5"
+#define RECON_VERSION @"6"
 
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
@@ -62,6 +62,7 @@ static const double kSampleInterval = 1.0;
 - (void)updateSampleButton;
 - (void)updateBadgeLook;
 - (void)btnToggleSampling;
+- (void)btnDeepProbe;
 - (void)togglePanel;
 @end
 
@@ -341,6 +342,98 @@ static NSString *framesJS(void) {
     return @"(function(){var a=[];try{for(var i=0;i<window.length;i++){try{a.push(i+'='+String(frames[i].location.href).slice(0,180))}catch(e){a.push(i+'=<blocked>')}}}catch(e){}return a.length?a.join('\\n'):'(no frames)'})()";
 }
 
+#pragma mark - v6: reach INTO the game iframe
+
+// Why v5 failed to dump the Cocos scene:
+//   -[WKWebView evaluateJavaScript:] ALWAYS runs in the web view's MAIN frame.
+//   Every helper therefore resolved the identifier `cc` against the MAIN
+//   frame's global object, where `cc` simply does not exist (the 241-key dump
+//   of the main frame lists no `cc`). So the scene block never ran, silently.
+//
+// v5 did prove the iframe is SAME-ORIGIN though: the frame-tree walk did
+// `for (var k in frames[0])` and got `cc` / `my` / `MYGameGlobal` back, with
+// `typeof` reporting real types. Same-origin means the main frame can read the
+// iframe's globals directly -- so we just hand the frame's window object to a
+// probe function and touch everything through it (W.cc, W.my, ...).
+// No eval() and no Function() are involved, so no CSP/unsafe-eval risk.
+static NSString *miniStateJS(void) {
+    return @"(function(){var W=null;try{W=frames[0]}catch(e){}if(!W)return 'noFrame';"
+           @"try{var cc=W.cc;if(!cc)return 'cc=<undef>';"
+           @"if(!cc.director||!cc.director.getScene)return 'cc-no-director';"
+           @"var sc=cc.director.getScene();if(!sc)return 'noScene';var n=0;"
+           @"(function w2(x,d){if(!x||d>9)return;n++;var c=x.children||[];for(var i=0;i<c.length;i++)w2(c[i],d+1)})(sc,0);"
+           @"return 'scene='+sc.name+' nodes='+n+' vp='+W.innerWidth+'x'+W.innerHeight}catch(e){return 'ERR '+e}})()";
+}
+
+// Full introspective dump of the LIVE game state, read from inside the iframe.
+static NSString *deepGameJS(void) {
+    return @"(function(){var out=[];"
+    @"function S(s){out.push(String(s))}"
+    @"var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W){return 'NO_IFRAME'}"
+    @"try{S('gameFrame='+String(W.location.href))}catch(e){S('gameFrame=<blocked>')}"
+    @"function P(W){"
+    @"var o=[];"
+    @"function S(s){o.push(String(s))}"
+    @"function J(v,mx){try{var s=JSON.stringify(v);if(s===undefined)s='[u]';if(mx&&s.length>mx)s=s.slice(0,mx)+'...';return s}catch(e){return '[circ]'}}"
+    @"function K(x){var a=[];try{for(var k in x)a.push(k)}catch(e){}return a}"
+    @"var cc=null,mg=null;"
+    @"try{cc=W.cc}catch(e){}"
+    @"try{mg=W.MYGameGlobal}catch(e){}"
+    @"S('--- A. game-realm globals ---');"
+    @"var gm=['cc','my','MYGameGlobal','GameGlobal','hp','zsAlipayCom','wx','canvas','screencanvas','Laya','egret','PIXI','game','Game','__globalAdapter'];"
+    @"for(var i=0;i<gm.length;i++){var t='<undef>';try{t=typeof W[gm[i]]}catch(e){t='<blocked>'}S('  '+gm[i]+'='+t)}"
+    @"try{S('  body='+String((W.document.body&&W.document.body.innerText)||'').replace(/\\s+/g,' ').slice(0,160))}catch(e){}"
+    @"try{var cv=W.document.querySelectorAll('canvas');S('  canvasCount='+cv.length+(cv.length?(' first='+cv[0].width+'x'+cv[0].height):''))}catch(e){}"
+    @"try{var scs=W.document.scripts||[];var sl=[];for(var i2=0;i2<scs.length&&i2<30;i2++){sl.push(String(scs[i2].src||'(inline)'+((scs[i2].text||'').length)+'B'))}S('  gameScripts('+scs.length+')='+sl.join(' | '))}catch(e){S('  scriptsErr '+e)}"
+    @"var ccjs=null,sc=null;"
+    @"try{ccjs=cc&&cc.js}catch(e){}"
+    @"function CN(c){try{if(ccjs&&ccjs.getClassName){var n=ccjs.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
+    @"function COMP(nd){var a=[];try{a=nd._components||nd.components||[]}catch(e){}return a}"
+    @"S('--- B. view / resolution ---');"
+    @"try{S('  ccVersion='+(cc.ENGINE_VERSION||(cc.sys&&cc.sys.version)))}catch(e){}"
+    @"try{S('  winSize='+J(cc.winSize))}catch(e){}"
+    @"try{S('  visibleSize='+J(cc.view.getVisibleSize()))}catch(e){}"
+    @"try{S('  frameSize='+J(cc.view.getFrameSize()))}catch(e){}"
+    @"try{S('  designRes='+J(cc.view.getDesignResolutionSize()))}catch(e){}"
+    @"S('--- C. cc.director scene tree ---');"
+    @"try{if(cc&&cc.director&&cc.director.getScene)sc=cc.director.getScene()}catch(e){S('  getSceneErr '+e)}"
+    @"if(!sc){S('  NO_SCENE (cc='+(typeof cc)+')')}else{"
+    @"S('  root='+sc.name);var lines=[],N=0;"
+    @"(function walk(nd,d){if(!nd||d>5||N>260)return;N++;var p=nd.position||{};var a=COMP(nd);var cs=[];"
+    @"for(var i=0;i<a.length;i++)cs.push(CN(a[i]));"
+    @"lines.push(new Array(d+1).join('  ')+nd.name+' ['+cs.join(',')+'] xy='+Math.round(p.x||0)+','+Math.round(p.y||0)+(nd.active===false?' OFF':''));"
+    @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
+    @"S(lines.join('\\n'))}"
+    @"S('--- D. data-bearing component props ---');"
+    @"var hits=0;"
+    @"if(sc){(function w2(nd,d){if(!nd||d>8||hits>48)return;var a=COMP(nd);"
+    @"for(var i=0;i<a.length;i++){var c=a[i];if(!c)continue;var ks=[];try{ks=Object.keys(c)}catch(e){}"
+    @"for(var j=0;j<ks.length;j++){var k=ks[j];if(k.charAt(0)==='_'||k.charAt(0)==='$')continue;var v;try{v=c[k]}catch(e){continue}"
+    @"if(v===null||v===undefined)continue;var tv=typeof v;"
+    @"if(tv==='object'&&typeof v.length==='number'&&v.length>=6){S('  @'+nd.name+' <'+CN(c)+'> .'+k+' len='+v.length+' = '+J(v,700));hits++}"
+    @"else if((tv==='number'||tv==='string'||tv==='boolean')&&/level|stage|round|cur|idx|index|dir|arrow|step|move|count|progress|score|board|grid|col|row/i.test(k)){S('  @'+nd.name+' <'+CN(c)+'> .'+k+' = '+J(v,90));hits++}}}"
+    @"var ch=nd.children||[];for(var z=0;z<ch.length;z++)w2(ch[z],d+1)})(sc,0)}"
+    @"S('  hits='+hits);"
+    @"S('--- E. classes / bundles ---');"
+    @"try{var rb=ccjs&&ccjs._registeredClassNames;if(rb){var kk=K(rb);S('  classNameCount='+kk.length);S('  names='+kk.slice(0,300).join(','))}}catch(e){}"
+    @"try{var bs=cc.assetManager&&cc.assetManager.bundles;if(bs)S('  assetBundles='+K(bs).join(','))}catch(e){}"
+    @"try{var gb=cc.game&&cc.game._bundles;if(gb)S('  gameBundles='+K(gb).join(','))}catch(e){}"
+    @"S('--- F. MYGameGlobal ---');"
+    @"if(!mg){S('  undefined')}else{var mk=K(mg);S('  keys('+mk.length+')='+mk.join(','));"
+    @"for(var i3=0;i3<mk.length&&i3<50;i3++){var k3=mk[i3];var v3;try{v3=mg[k3]}catch(e){continue}var t3=typeof v3;"
+    @"if(t3==='function')continue;S('   '+k3+' : '+t3+' = '+J(v3,240));"
+    @"if(v3&&t3==='object'){var k4=K(v3);if(k4.length)S('      .'+k4.slice(0,28).join('/'))}}}"
+    @"S('--- G. localStorage ---');"
+    @"try{var ls=W.localStorage;var n=0;var o2=[];for(var i4=0;i4<ls.length&&n<40;i4++){var k5=ls.key(i4);o2.push(k5+'='+String(ls.getItem(k5)).slice(0,90));n++}S(o2.join('\\n'))}catch(e){S('  err '+e)}"
+    @"return o.join('\\n')}"
+    @"var s='';try{s=P(W)}catch(e){s='PROBE_ERR '+e}"
+    @"S(s);"
+    @"return out.join('\\n')})()";
+}
+
 // Higher score = more likely to be the game's JS host.
 static NSInteger scoreWebView(WKWebView *w) {
     NSString *url = [[w.URL absoluteString] lowercaseString] ?: @"";
@@ -400,8 +493,12 @@ static NSString *probeAllWebViews(void) {
         WKWebView *w = wes[i];
         [r appendFormat:@"\n--- wv[%lu] %@ ---\n", (unsigned long)i, descs[i]];
         [r appendFormat:@"compact: %@\n", evalJS(w, compactJS(), 2.0)];
-        [r appendFormat:@"frames:/n%@/n", evalJS(w, framesJS(), 2.0)];
-        [r appendFormat:@"heavy:/n%@/n", evalJS(w, heavyJS(), 3.0)];
+        [r appendFormat:@"frames:\n%@\n", evalJS(w, framesJS(), 2.0)];
+        [r appendFormat:@"heavy:\n%@\n", evalJS(w, heavyJS(), 3.0)];
+        if ((NSInteger)i == best) {
+            [r appendFormat:@"state: %@\n", evalJS(w, miniStateJS(), 2.0)];
+            [r appendFormat:@"DEEP:\n%@\n", evalJS(w, deepGameJS(), 5.0)];
+        }
     }
     return r;
 }
@@ -609,7 +706,7 @@ static NSString *captureSampleNow(NSInteger idx) {
         t0];
     [s appendFormat:@"webviews=%lu best=%ld\n", (unsigned long)wes.count, (long)best];
     if (taps.count) {
-        [s appendFormat:@"TAPS:/n  %@\n", [taps componentsJoinedByString:@"\n  "]];
+        [s appendFormat:@"TAPS:\n  %@\n", [taps componentsJoinedByString:@"\n  "]];
     }
     if (!wes.count) {
         [s appendString:@"JS: <no webview>\n"];
@@ -619,10 +716,16 @@ static NSString *captureSampleNow(NSInteger idx) {
         [s appendFormat:@"  wv[%lu] %@\n    %@\n", (unsigned long)i, descs[i],
             evalJS(wes[i], compactJS(), 1.5)];
     }
-    if (idx % 5 == 0 && best >= 0 && (NSUInteger)best < wes.count) {
-        [s appendFormat:@"  HEAVY wv[%ld] frames:/n%@/n", (long)best,
-            evalJS(wes[best], framesJS(), 2.0)];
-        [s appendFormat:@"  HEAVY dump:/n%@/n", evalJS(wes[best], heavyJS(), 3.0)];
+    if (best >= 0 && (NSUInteger)best < wes.count) {
+        // Cheap 1 Hz heartbeat: does the game frame expose a live Cocos scene,
+        // and how many nodes does it have? Lets us line state changes up with taps.
+        [s appendFormat:@"  state: %@\n", evalJS(wes[best], miniStateJS(), 1.5)];
+        if (idx % 5 == 0) {
+            [s appendFormat:@"  HEAVY wv[%ld] frames:\n%@\n", (long)best,
+                evalJS(wes[best], framesJS(), 2.0)];
+            [s appendFormat:@"  HEAVY dump:\n%@\n", evalJS(wes[best], heavyJS(), 3.0)];
+            [s appendFormat:@"  DEEP dump:\n%@\n", evalJS(wes[best], deepGameJS(), 5.0)];
+        }
     }
     return s;
 }
@@ -759,10 +862,22 @@ static void runRecon(BOOL showPanel) {
         [dumpBtn addTarget:self action:@selector(btnExportDump) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:dumpBtn];
 
-        // Row 3: full-width recording toggle
+        // Row 3: deep probe (left) + recording toggle (right)
         CGFloat row3 = row2 + bh + gap;
+        CGFloat probeW = 92.0;
+
+        UIButton *probeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        probeBtn.frame = CGRectMake(pad, row3, probeW, bh);
+        [probeBtn setTitle:@"深度探针" forState:UIControlStateNormal];
+        [probeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        probeBtn.backgroundColor = [UIColor colorWithRed:0.30 green:0.30 blue:0.62 alpha:1.0];
+        probeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        probeBtn.layer.cornerRadius = 7;
+        [probeBtn addTarget:self action:@selector(btnDeepProbe) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:probeBtn];
+
         gSampleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        gSampleBtn.frame = CGRectMake(pad, row3, cardW - pad * 2, bh);
+        gSampleBtn.frame = CGRectMake(pad + probeW + gap, row3, cardW - pad * 2 - probeW - gap, bh);
         [gSampleBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         gSampleBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
         gSampleBtn.layer.cornerRadius = 7;
@@ -854,6 +969,33 @@ static void runRecon(BOOL showPanel) {
                 [self presentActivityWithItems:@[[NSURL fileURLWithPath:path]]];
             } else {
                 [self showToast:@"导出失败：H5 缓存里没有可读文本文件"];
+            }
+        });
+    });
+}
+
+// v6: the button that actually matters. Run it WHILE YOU ARE INSIDE A LEVEL.
+// It reaches into the game iframe's realm and dumps the live Cocos scene,
+// every component property that looks like board/level data, MYGameGlobal,
+// the bundled class names and localStorage. Then it shares the file.
+- (void)btnDeepProbe {
+    [self showToast:@"正在深度探测游戏帧…"];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableString *r = [NSMutableString string];
+        [r appendFormat:@"ArrowGameRecon DEEP probe v%@ @ %@\n", RECON_VERSION, [NSDate date]];
+        [r appendString:@"Trigger: 深度探针按钮\n"];
+        [r appendString:dumpWindowList()];
+        [r appendString:probeAllWebViews()];
+        NSString *path = [sandboxDocs() stringByAppendingPathComponent:@"arrowgame_deep.txt"];
+        NSError *err = nil;
+        [r writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!err) {
+                if (gReconTextView) gReconTextView.text = r;
+                [self showToast:@"深度探测完成，正在打开分享…"];
+                [self presentActivityWithItems:@[[NSURL fileURLWithPath:path]]];
+            } else {
+                [self showToast:@"深度探测写入失败"];
             }
         });
     });
