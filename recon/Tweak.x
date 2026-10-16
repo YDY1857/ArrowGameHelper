@@ -46,7 +46,7 @@ static dispatch_queue_t gSampleQueue = nil;
 static const NSInteger kMaxSamples = 180;
 static const double kSampleInterval = 1.0;
 
-#define RECON_VERSION @"4"
+#define RECON_VERSION @"5"
 
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
@@ -146,23 +146,24 @@ static NSArray<UIWindow *> *appWindows(void) {
     return result;
 }
 
-// Prefer the key window among the app's own windows, else the biggest visible
-// normal-level window, else anything visible.
+// Pick the window the game is actually in. Ranking by key-window status alone
+// was wrong: a 44x123 BEEAlertManagedWindow was key and got picked instead of
+// the full-screen game window. Now: visible, normal level, then biggest.
 static UIWindow *getMainWindow(void) {
     NSArray<UIWindow *> *wins = appWindows();
-    for (UIWindow *w in wins) {
-        if (w.isKeyWindow && !w.hidden) return w;
-    }
     UIWindow *best = nil;
+    double bestScore = -1;
     for (UIWindow *w in wins) {
         if (w.hidden) continue;
-        if (w.windowLevel != UIWindowLevelNormal) continue;
-        if (!best || w.frame.size.height > best.frame.size.height) best = w;
+        CGRect f = w.frame;
+        double area = (double)f.size.width * (double)f.size.height;
+        if (area <= 0) continue;
+        double sc = area;
+        if (w.windowLevel == UIWindowLevelNormal) sc += 1e7;
+        if (w.isKeyWindow) sc += 1e6;
+        if (sc > bestScore) { bestScore = sc; best = w; }
     }
     if (best) return best;
-    for (UIWindow *w in wins) {
-        if (!w.hidden) return w;
-    }
     return wins.firstObject;
 }
 
@@ -288,26 +289,119 @@ static NSString *evalJS(WKWebView *webView, NSString *js, NSTimeInterval timeout
     return val ?: @"<nil>";
 }
 
-static NSString *probeWebView(WKWebView *webView) {
-    NSMutableString *r = [NSMutableString string];
-    if (!webView) {
-        [r appendString:@"\n=== WebView probe ===\nNo WKWebView found in the app's windows.\n"];
+// ---- probe suites --------------------------------------------------------
+
+// Compact per-webview summary; cheap enough to run on every sample.
+static NSString *compactJS(void) {
+    return @"(function(){var o={};"
+           @"try{o.href=String(location.href).slice(0,220)}catch(e){}"
+           @"try{o.title=String(document.title||'').slice(0,80)}catch(e){}"
+           @"try{o.frames=window.length}catch(e){}"
+           @"try{o.canvas=document.querySelectorAll('canvas').length}catch(e){}"
+           @"try{o.scripts=document.scripts.length}catch(e){}"
+           @"try{o.ready=String(document.readyState)}catch(e){}"
+           @"try{o.body=String((document.body&&document.body.innerText)||'').replace(/\\s+/g,' ').slice(0,140)}catch(e){}"
+           @"var eng=[];"
+           @"['cc','Laya','egret','PIXI','THREE','BABYLON','Phaser','Konva','createjs','GameGlobal','my','wx','canvas','game','Game','$'].forEach(function(k){try{if(typeof window[k]!=='undefined')eng.push(k+':'+typeof window[k])}catch(e){}});"
+           @"o.eng=eng.join(',');"
+           @"return JSON.stringify(o)})()";
+}
+
+// Walk the frame tree (top + up to 4 sub-frames, 2 levels) and dump every
+// global whose name looks game-related.
+static NSString *heavyJS(void) {
+    return @"(function(){var out=[];"
+           @"function scan(w,path,depth){if(depth>2)return;var ks=[];"
+           @"try{for(var k in w)ks.push(k)}catch(e){out.push('### '+path+' <blocked>');return}"
+           @"var fn=0;try{fn=w.length||0}catch(e){}"
+           @"out.push('### '+path+'  keys='+ks.length+'  frames='+fn);"
+           @"var hits=0;"
+           @"for(var i=0;i<ks.length;i++){var k=ks[i];"
+           @"if(/^(on|webkit|moz|MS)/.test(k))continue;"
+           @"if(!/game|level|arrow|grid|puzzle|board|scene|state|model|data|cc|laya|egret|pixi|three|babylon|phaser|gameglobal|canvas|anim|node|sprite|^(my|wx)$/i.test(k))continue;"
+           @"var v,t='?';try{v=w[k];t=typeof v}catch(e){t='<err>'}"
+           @"var sv='';if(t!=='function'&&t!=='undefined'&&v!==null){try{sv=JSON.stringify(v)}catch(e){sv='[circ]'}if(sv===undefined)sv='[u]';if(sv.length>260)sv=sv.slice(0,260)+'...'}"
+           @"out.push('  '+k+' : '+t+' = '+sv);hits++;if(hits>70)break;}"
+           @"try{if(typeof cc!=='undefined'&&cc.director&&cc.director.getScene()){var sc=cc.director.getScene(),tr=[],n=0;"
+           @"(function walk(nd,d){if(d>3||n>200)return;n++;var p=nd.position||{};"
+           @"tr.push(new Array(d+1).join('  ')+nd.name+' <'+(nd.constructor&&nd.constructor.name)+'> xy='+Math.round(p.x||0)+','+Math.round(p.y||0)+' act='+(nd.active===false?0:1)+' op='+(nd.opacity===undefined?'-':nd.opacity));"
+           @"var c=nd.children||[];for(var j=0;j<c.length;j++)walk(c[j],d+1)})(sc,0);"
+           @"out.push('--- cc.director scene tree ---');out.push(tr.join('\\n'))}}catch(e){out.push('cc err '+e)}"
+           @"for(var f=0;f<fn&&f<4;f++){try{scan(w.frames[f],path+'['+f+']',depth+1)}catch(e){out.push(path+'['+f+'] <blocked>')}}"
+           @"}"
+           @"try{scan(window,'top',0)}catch(e){out.push('ERR '+e)}"
+           @"var ss=[];try{var scs=document.scripts||[];for(var i=0;i<scs.length&&i<25;i++){ss.push(String(scs[i].src||('(inline '+((scs[i].text||'').length)+'B)')))}}catch(e){ss=['<err> '+e]}"
+           @"out.push('--- scripts ('+ss.length+') ---');out.push(ss.join('\\n'));"
+           @"try{var ak=[];for(var q in window)ak.push(q);out.push('--- all window keys ('+ak.length+') ---');out.push(ak.slice(0,180).join('\\n'))}catch(e){}"
+           @"return out.join('\\n')})()";
+}
+
+// Sub-frame URLs (cross-origin ones may be unreadable).
+static NSString *framesJS(void) {
+    return @"(function(){var a=[];try{for(var i=0;i<window.length;i++){try{a.push(i+'='+String(frames[i].location.href).slice(0,180))}catch(e){a.push(i+'=<blocked>')}}}catch(e){}return a.length?a.join('\\n'):'(no frames)'})()";
+}
+
+// Higher score = more likely to be the game's JS host.
+static NSInteger scoreWebView(WKWebView *w) {
+    NSString *url = [[w.URL absoluteString] lowercaseString] ?: @"";
+    NSInteger s = 0;
+    if ([url containsString:@"antgame"]) s += 100;
+    if ([url containsString:@"game"]) s += 40;
+    if ([url containsString:@"framework"]) s -= 30;
+    if ([url containsString:@"paladin"]) s += 5;
+    CGSize sz = w.frame.size;
+    // A zero-size web view is a JS-only host (the XR game engine style).
+    if (sz.width < 1.0 || sz.height < 1.0) s += 60;
+    return s;
+}
+
+static NSString *frameDesc(WKWebView *w) {
+    CGRect f = w.frame;
+    return [NSString stringWithFormat:@"%@ (%.0f,%.0f,%.0f,%.0f) score=%ld",
+            NSStringFromClass([w class]),
+            f.origin.x, f.origin.y, f.size.width, f.size.height,
+            (long)scoreWebView(w)];
+}
+
+// All web views + their descriptions, gathered on the main thread.
+static NSArray<WKWebView *> *webViewsWithInfo(NSArray<NSString *> **outDesc, NSInteger *outBest) {
+    __block NSArray<WKWebView *> *all = nil;
+    __block NSArray<NSString *> *desc = nil;
+    __block NSInteger best = -1;
+    runOnMainSync(^{
+        NSArray<WKWebView *> *a = allWKWebViews();
+        NSMutableArray *d = [NSMutableArray array];
+        NSInteger bi = -1, bs = NSIntegerMin;
+        for (NSUInteger i = 0; i < a.count; i++) {
+            NSInteger sc = scoreWebView(a[i]);
+            [d addObject:frameDesc(a[i])];
+            if (sc > bs) { bs = sc; bi = (NSInteger)i; }
+        }
+        all = a; desc = d; best = bi;
+    });
+    if (outDesc) *outDesc = desc;
+    if (outBest) *outBest = best;
+    return all ?: @[];
+}
+
+// One-shot deep probe of EVERY web view in the app.
+static NSString *probeAllWebViews(void) {
+    NSMutableString *r = [NSMutableString stringWithString:@"\n=== WebView probe ===\n"];
+    NSArray<NSString *> *descs = nil;
+    NSInteger best = -1;
+    NSArray<WKWebView *> *wes = webViewsWithInfo(&descs, &best);
+    if (!wes.count) {
+        [r appendString:@"No WKWebView found in the app's windows.\n"];
         return r;
     }
-    [r appendFormat:@"\n=== WebView probe ===\nURL: %@\nWKWebView subclass: %@\n",
-        webView.URL.absoluteString ?: @"<nil>", NSStringFromClass([webView class])];
-
-    NSArray *probes = @[
-        @"typeof cc",
-        @"(typeof cc!=='undefined'&&cc.director&&cc.director.getScene())?(cc.director.getScene().name+' | children='+cc.director.getScene().children.length):'no-cc-scene'",
-        @"(function(){if(typeof cc==='undefined'||!cc.director)return 'no-cc';var s=cc.director.getScene();if(!s)return 'no-scene';var o=[];function w(n,d){if(d>2||o.length>150)return;o.push(('  ').repeat(d)+n.name+' <'+(n.constructor&&n.constructor.name)+'>');var c=n.children||[];for(var i=0;i<c.length;i++)w(c[i],d+1);}w(s,0);return o.join('\\n')})()",
-        @"Object.keys(window).filter(function(k){return /game|level|arrow|grid|puzzle|stage|board|cc|scene/i.test(k)}).join(',')",
-        @"document.querySelectorAll('canvas').length+' canvas; scripts='+document.scripts.length+' title='+(document.title||'')",
-        @"document&&document.body?document.body.innerText.slice(0,400):'no-body'"
-    ];
-
-    for (NSString *js in probes) {
-        [r appendFormat:@"JS[%@] =>\n%@\n---\n", js, evalJS(webView, js, 3.0)];
+    [r appendFormat:@"Found %lu WKWebView(s); best index = %ld\n",
+        (unsigned long)wes.count, (long)best];
+    for (NSUInteger i = 0; i < wes.count && i < 6; i++) {
+        WKWebView *w = wes[i];
+        [r appendFormat:@"\n--- wv[%lu] %@ ---\n", (unsigned long)i, descs[i]];
+        [r appendFormat:@"compact: %@\n", evalJS(w, compactJS(), 2.0)];
+        [r appendFormat:@"frames:/n%@/n", evalJS(w, framesJS(), 2.0)];
+        [r appendFormat:@"heavy:/n%@/n", evalJS(w, heavyJS(), 3.0)];
     }
     return r;
 }
@@ -478,39 +572,6 @@ static void appendTextToFile(NSString *path, NSString *text) {
     }
 }
 
-// One compact JS snapshot. Globals are only re-scanned every few samples
-// because they rarely change and they are the bulkiest part.
-static NSString *sampleJS(BOOL includeGlobals) {
-    NSMutableString *js = [NSMutableString string];
-    [js appendString:@"(function(){var o={};"];
-    [js appendString:@"try{o.url=String(location.href).slice(0,200)}catch(e){}"];
-    [js appendString:@"try{o.title=String(document.title||'').slice(0,120)}catch(e){}"];
-    [js appendString:@"try{o.canvas=document.querySelectorAll('canvas').length}catch(e){}"];
-    [js appendString:@"try{var c=document.querySelector('canvas');if(c)o.canvasSize=c.width+'x'+c.height}catch(e){}"];
-    [js appendString:@"try{if(typeof cc!=='undefined'&&cc.director&&cc.director.getScene()){"];
-    [js appendString:@"var s=cc.director.getScene(),out=[],n=0;"];
-    [js appendString:@"function walk(nd,d){if(d>4||n>350)return;n++;var p=nd.position||{};"];
-    [js appendString:@"out.push(new Array(d+1).join('  ')+nd.name+' <'+(nd.constructor&&nd.constructor.name)+'> xy='"];
-    [js appendString:@"+Math.round(p.x||0)+','+Math.round(p.y||0)+' act='+(nd.active===false?0:1)"];
-    [js appendString:@"+' op='+(nd.opacity===undefined?'-':nd.opacity)+' sc='+(nd.scaleX===undefined?'-':nd.scaleX));"];
-    [js appendString:@"var ch=nd.children||[];for(var i=0;i<ch.length;i++)walk(ch[i],d+1);}"];
-    [js appendString:@"walk(s,0);o.ccScene=s.name+' nodes='+n;o.ccTree=out.join('\\n');"];
-    [js appendString:@"}else{o.cc='none'}}catch(e){o.ccErr=String(e)}"];
-    if (includeGlobals) {
-        [js appendString:@"try{var g=[],skip=/^(top|window|self|document|location|navigator|history|screen|frames|parent|localStorage|sessionStorage|indexedDB|crypto|performance|console|JSON|Math|Date|Array|Object|String|Number|Boolean|RegExp|Error|Promise|Map|Set|Symbol|Proxy|Reflect|Intl|WebAssembly|globalThis)$/;"];
-        [js appendString:@"for(var k in window){if(skip.test(k))continue;var v;"];
-        [js appendString:@"try{v=window[k]}catch(e){continue}var t=typeof v;"];
-        [js appendString:@"if(t==='function'){if(/game|level|arrow|grid|puzzle|scene|data|state|model|app|cc/i.test(k))g.push(k+'=fn');continue;}"];
-        [js appendString:@"if(t!=='object'&&t!=='string'&&t!=='number'&&t!=='boolean')continue;"];
-        [js appendString:@"var sv='';try{sv=JSON.stringify(v)}catch(e){sv='[circ]'}"];
-        [js appendString:@"if(sv===undefined)sv='[undef]';if(sv.length>400)sv=sv.slice(0,400)+'...';"];
-        [js appendString:@"g.push(k+'='+sv);if(g.length>100)break;}"];
-        [js appendString:@"o.globals=g.join('\\n')}catch(e){o.gErr=String(e)}"];
-    }
-    [js appendString:@"return JSON.stringify(o);})()"];
-    return js;
-}
-
 // Windows + full view tree of the app's main window.
 static NSString *snapshotFullState(void) {
     NSMutableString *s = [NSMutableString string];
@@ -531,15 +592,9 @@ static NSString *snapshotFullState(void) {
 static NSString *captureSampleNow(NSInteger idx) {
     NSDate *t0 = [NSDate date];
 
-    __block WKWebView *wv = nil;
-    __block NSUInteger wvCount = 0;
-    runOnMainSync(^{
-        NSArray<WKWebView *> *all = allWKWebViews();
-        wvCount = all.count;
-        wv = all.firstObject;
-    });
-
-    NSString *jsOut = wv ? evalJS(wv, sampleJS(idx % 5 == 0), 2.0) : @"<no-webview>";
+    NSArray<NSString *> *descs = nil;
+    NSInteger best = -1;
+    NSArray<WKWebView *> *wes = webViewsWithInfo(&descs, &best);
 
     NSMutableArray *taps = nil;
     @synchronized(gTapLog) {
@@ -552,13 +607,23 @@ static NSString *captureSampleNow(NSInteger idx) {
         (long)idx,
         gSessionStart ? [t0 timeIntervalSinceDate:gSessionStart] : 0.0,
         t0];
-    [s appendFormat:@"webview=%@ count=%lu\n",
-        wv ? NSStringFromClass([wv class]) : @"<none>",
-        (unsigned long)wvCount];
+    [s appendFormat:@"webviews=%lu best=%ld\n", (unsigned long)wes.count, (long)best];
     if (taps.count) {
-        [s appendFormat:@"TAPS:\n  %@\n", [taps componentsJoinedByString:@"\n  "]];
+        [s appendFormat:@"TAPS:/n  %@\n", [taps componentsJoinedByString:@"\n  "]];
     }
-    [s appendFormat:@"JS: %@\n", jsOut];
+    if (!wes.count) {
+        [s appendString:@"JS: <no webview>\n"];
+        return s;
+    }
+    for (NSUInteger i = 0; i < wes.count && i < 4; i++) {
+        [s appendFormat:@"  wv[%lu] %@\n    %@\n", (unsigned long)i, descs[i],
+            evalJS(wes[i], compactJS(), 1.5)];
+    }
+    if (idx % 5 == 0 && best >= 0 && (NSUInteger)best < wes.count) {
+        [s appendFormat:@"  HEAVY wv[%ld] frames:/n%@/n", (long)best,
+            evalJS(wes[best], framesJS(), 2.0)];
+        [s appendFormat:@"  HEAVY dump:/n%@/n", evalJS(wes[best], heavyJS(), 3.0)];
+    }
     return s;
 }
 
@@ -582,14 +647,9 @@ static void runRecon(BOOL showPanel) {
         [report appendString:@"No app window found.\n"];
     }
 
-    // Collect the web views on the main thread (view traversal off-main is unsafe).
-    NSArray<WKWebView *> *wes = allWKWebViews();
-    WKWebView *webView = wes.firstObject;
-
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        [report appendFormat:@"\n=== WKWebView count in app windows: %lu ===\n", (unsigned long)wes.count];
         [report appendString:dumpRelevantClasses()];
-        [report appendString:probeWebView(webView)];
+        [report appendString:probeAllWebViews()];
         [report appendString:dumpSandboxTrees()];
 
         NSString *path = reconFilePath();
