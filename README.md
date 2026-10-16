@@ -24,7 +24,7 @@
 
 因为从外部无法直接拿到支付宝小程序内部的关卡数据结构，我把它拆成两步，避免瞎猜：
 
-- **阶段一（已做好）· 侦察版 `recon/`**：注入支付宝，你跑一遍游戏，**三指轻点**触发。它会把当前界面的视图层级、相关类名、WebView 里的 JS 全局变量、以及小程序包路径全部 dump 成 `/var/mobile/arrowgame_recon.txt`，并在屏幕上显示摘要。
+- **阶段一（已做好）· 侦察版 `recon/`**：注入支付宝，你跑一遍游戏，**点屏幕上的红色「RG」小球**触发。它会把当前界面的视图层级、相关类名、WebView 里的 JS 全局变量、以及小程序包路径全部 dump 成 App 沙盒里的 `Documents/arrowgame_recon.txt`，并在屏幕上显示摘要。
 - **阶段二（待你数据）· 求解版 `ArrowGameHelper/`**：你把我采集到的信息发给我，我据此找到箭头真正的数据来源（原生 View / Cocos 节点 / WebView JS 状态），把自动抓取逻辑写进 Tweak，替换掉现在手动输入 grid 的部分。
 
 > 阶段一现在就能编译、安装、出数据；阶段二依赖你采集到的真实信息，所以我没法提前写死。
@@ -167,29 +167,107 @@ git push -u origin main
 1. 安装 `ArrowGameRecon`（越狱用 deb；非越狱见下面「非越狱注入」章节）。
 2. 杀掉并重新打开支付宝。
 3. **开屏约 3 秒后，屏幕右侧会出现一个红色「RG」小球** —— 这就是 dylib 加载成功的可视证据。小球可拖动。
-4. **开屏约 8 秒后，报告面板会自己弹出来一次**（全链路自检，证明加载+hook+窗口都正常）。
-5. 平时使用：**点一下「RG」小球**即可触发侦察；三指长按 0.4 秒也可触发。
+4. **开屏约 8 秒后会跑一次自检，但不会弹面板** —— 只在顶部闪一条绿色提示条（约 2.5 秒后自动消失），报告同时写入文件。这样就不会打断你的操作。
+5. 平时使用：**点一下「RG」小球**即可触发侦察并弹出报告卡片；三指长按 0.4 秒也可触发。
 6. 进到箭头小游戏的关卡界面，再点小球触发一次，报告反映的才是游戏界面。
-7. 面板上有两个按钮：
-   - **复制全部** → 报告进剪贴板，粘贴到备忘录/微信发我
-   - **分享 / 存文件** → 走系统分享，可发微信、AirDrop、或「存储到文件」
-8. 再点一下小球可关闭面板。
+7. 报告卡片只占上半屏，**底部留了一条透明区**，下半屏的 App 仍然可以正常点（触摸不会被卡片吃掉）。
+8. 卡片上有五个按钮（三排）：
+   - **关闭** / **复制报告** / **分享报告** / **导出缓存文本**（见上一节）
+   - **开始采集**（跨整行，绿色）→ **核心功能**，见下一节
+9. 也可以直接**再点一下「RG」小球**关闭面板。
 
-> **诊断对照表**
-> - 看到 RG 小球 → dylib 已加载，注入成功。
-> - 看不到 RG 小球 → dylib 没加载（注入问题）：检查 Actions 日志是否有 `OK: no substrate symbols`；确认注入的是 `ArrowGameRecon.dylib`；或换用 deb 注入；确认重签名后支付宝仍能正常启动。
+---
+
+## 深度探针（v6，首要用法）
+
+引擎已经确认是 **Cocos Creator**，游戏跑在 `PLDWebView` 里一个**同源 iframe** (`game-iframe.html`) 中，
+`cc` / `my` / `MYGameGlobal` 都挂在那个 iframe 的 window 上。所以**游戏状态是可以直接读出来的**：
+
+1. 进入箭头游戏关卡，看到盘面（**必须在关卡里**，否则读不到）
+2. 点 RG 小球 → 面板出现 → 点蓝色的 **「深度探针」**
+3. 等 1~2 秒 → 自动弹分享面板 → 导出 `arrowgame_deep.txt`
+
+这个文件里有七段：游戏帧的全局变量与已加载 JS、Cocos 版本与设计分辨率、**完整场景树（节点名 + 组件类名 + 坐标）**、
+**所有带数组/关卡号属性的组件**（棋盘数据就在这）、Cocos 注册类名与 bundle、`MYGameGlobal` 结构、localStorage。
+
+---
+
+## 录制模式（v4，配合深度探针使用）
+
+一次性的快照只能看到"某一刻"，而关卡数据的变化规律要**看你操作前后**才看得出来。所以 v4 加了录制：
+
+1. 进入箭头游戏关卡，看到盘面
+2. 点 RG 小球 → 面板出现 → 点绿色的 **「开始采集」**
+3. **面板会自动收起**（不挡你玩），顶部提示条一闪，**RG 小球变成橙色的「REC」** = 正在录
+4. **正常玩几局**：点箭头、过关、换关卡……想录多久录多久（上限 180 秒，1 秒采一次）
+5. 玩完点一下小球 → 面板回来 → 点 **「停止并导出」**
+6. 弹分享面板 → 发微信/存文件 → 把 `arrowgame_samples.txt` 发我
+
+采集了什么：
+
+- 每 1 秒一次的 **JS/Cocos 状态快照**（场景节点树、坐标、可见性、opacity、canvas 尺寸、全局变量）
+- 每秒一行 **游戏帧心跳** `state: scene=<场景名> nodes=<节点数> vp=<视口>`，用来观察盘面是否随操作变化
+- 每 5 秒一次 **DEEP 块**（完整场景树 + 棋盘数组 + `MYGameGlobal`），把"哪一步盘面变了"钉死
+- **你每一次点击的坐标 + 命中的视图类名**（这是关键：能把"你点哪儿"和"状态怎么变"对上）
+- 开始和结束各一次完整视图层级
+
+> 上限 180 次会**自动停止**并弹分享，不用担心文件失控。
+
+---
+
+## 诊断对照表
+
+- 看到 RG 小球 → dylib 已加载，注入成功。
+- 看不到 RG 小球 → dylib 没加载（注入问题）：检查 Actions 日志是否有 `OK: no substrate symbols`；确认注入的是 `ArrowGameRecon.dylib`；或换用 deb 注入；确认重签名后支付宝仍能正常启动。
+
+> **版本演进**
+>
+> **v2（2026-10-16）** 修了「面板一弹出整个 App 就点不动」。根因：**普通 `UIWindow` 在空白处 `hitTest:` 会返回窗口自己**，导致穿透逻辑从未生效，全屏触摸被覆盖层吃掉。改法：`ReconWindow`（空白区返回 `nil`）+ 面板卡片化 + 明确「关闭」按钮 + 8 秒自检改为静默。
+>
+> **v3（2026-10-16）** 修了「采错对象」并大幅扩容采集：
+> - **[BUGFIX]** `getMainWindow()` 原来按 `isKeyWindow` 取窗口，结果取到了**我们自己的悬浮球窗口**，整份视图层级 dump 全是自己的覆盖层，「No WKWebView detected」也就毫无意义。现在排除自有窗口，并**列出所有窗口**（类名 / level / rootVC），另外不再抢 key 窗口（`canBecomeKeyWindow` 返回 `NO`）。
+> - **[NEW]** 沙盒**目录树**dump：`Library/Caches/H5CustomFiles`、`Documents/PYLFilemanager`。
+> - **[NEW]** **Cocos Creator 感知的 JS 探测**：`window.cc`、`cc.director.getScene()` 节点树、canvas 数量。
+> - **[NEW]** 「导出缓存文本」：把 H5 缓存里的 js/json/html 拼成一个 `.txt`。**纯文本拼接，不用 zip/tar，零二进制格式风险。**
+>
+> **v4（2026-10-16）** 加了**录制模式**：1 Hz 采样 + 记录每次点击的坐标与命中视图，用来对齐"操作 ↔ 状态变化"。采集期间面板自动收起，小球变橙色 `REC`。
+>
+> **v5（2026-10-16）** 依据第 2 轮实测数据修正与扩容：
+> - **[BUGFIX]** 窗口选择原来"key window 优先"，而启动瞬间 key 是一个 **44×123 的 `BEEAlertManagedWindow`**，于是整份层级 dump 采到了那个小窗。现在改为"可见 + normal level + 面积最大"打分排序。
+> - **[BUGFIX]** WebView 探测原来只取**第一个**，而第一个是个无关的广告小窗，28 个样本全是同一页无关数据。现在**遍历全部 WebView**，按 URL/尺寸打分挑出最可能是游戏宿主的那一个。
+> - **[NEW]** **递归走 frame 树**（top + 4 个子 frame × 2 层）dump 游戏状态全局变量 —— 因为顶层窗口的 `window.length = 1`，真正的游戏内容很可能在 iframe 里。
+> - **[NEW]** heavy 探测额外输出**页面 script 源地址**与**未过滤的 window 键名**，用于定位游戏 JS 包并兜底关键词遗漏。
+> - 实测确认架构：`XRNativeGameContentView → PLDOpenGLView → PLDJITRenderPlus → AntEAGLView`（OpenGL 渲染）+ `PLDJITRender → PLDWebView`（**零尺寸的 JS 宿主 WebView**）。即支付宝 XR 原生游戏引擎。
+>
+> **v6（2026-10-16）** 依据第 3 轮实测数据，打通「读出实时游戏状态」这条路：
+> - **[BUGFIX 关键]** v3~v5 的 Cocos 场景树探测**一行都没执行过**。根因：`-[WKWebView evaluateJavaScript:]` **永远只在 WebView 的 main frame 执行**，所以探针里所有 `cc` 都解析到 main frame 的全局对象上 —— 而 main frame 根本没有 `cc`（实测 241 个 window key 里确实没有），`typeof cc !== 'undefined'` 直接为假，**静默跳过**。
+> - **[NEW]** 探针改为**跨 frame 读取**：把游戏 iframe 的 window 对象当参数传进探针函数，一切走 `W.cc` / `W.my` / `W.MYGameGlobal`。第 2 轮已经实测证明两个 frame **同源**（`for (var k in frames[0])` 能读出 `cc`/`my`/`MYGameGlobal` 并拿到真实类型），所以主 frame 可以直接读。**不使用 `eval` / `Function`，避开 CSP 与 `unsafe-eval` 风险。**
+> - **[NEW]** 新增**「深度探针」按钮**（面板第 3 行左侧），进关卡后一键导出 `arrowgame_deep.txt`。
+> - **[NEW]** 深度探测分七段：游戏帧全局与已加载 JS、Cocos 版本/设计分辨率/适配、**完整场景树（节点名 + 组件类名 + 坐标 + active）**、**所有 length ≥ 6 的数组属性与名字像关卡号的标量**（棋盘数据探测器）、Cocos 注册类名与 bundle 列表、`MYGameGlobal` 结构、localStorage。
+> - **[NEW]** 采样里每秒加一行 **游戏帧心跳** `state: scene=… nodes=… vp=WxH`（1 Hz 成本极低），每 5 个样本追加一次 **DEEP dump**，用于把点击与盘面变化对齐。
+> - **[CHORE]** 修掉若干 `/n` 手误（本该是换行却写成了字面量 `/n`）。另：**实测确认 `arrowgame_h5dump.txt` 里没有箭头游戏的文件**（是另几个小游戏的龙骨动画与 Unity 日志），缓存导出这条路作废。
+> - 附：截图量测棋盘点位 `x 33.7→406 pt`、`y 200.8→755 pt`，格距 `≈12.0 pt`，约 **32 列 × 46 行** —— 留作 Plan B（截图识别）备用。
 
 **报告文件路径**（跟随运行环境自动选择）：
 
 - 非越狱 / 重签名 IPA：`<支付宝沙盒>/Documents/arrowgame_recon.txt`
 - 越狱：同样是 App 沙盒内的 `Documents`（用 Filza 进容器取）
 
-侦察报告包含四块：
+同目录下还会生成：`arrowgame_deep.txt`（深度探针）、`arrowgame_samples.txt`（录制）、`arrowgame_h5dump.txt`（缓存导出）。
 
-- `=== View hierarchy ===`：整个界面从 keyWindow 往下每一层 View 的类名和位置。用来判断游戏是原生 UIView、Cocos/Unity 的 GL 层、还是包在 WKWebView 里。
-- `=== Relevant Objective-C classes ===`：所有类名里带 `Arrow/Game/Level/Grid/Puzzle/Sprite/Node/Canvas/MiniApp/...` 的类，是后续 hook 的候选。
-- `=== WebView probe ===`：如果界面里有 WKWebView，会尝试 dump 出 JS 里跟 `game/level/arrow/grid` 相关的全局变量和页面文本。小程序游戏大多走这条路。
-- `=== Mini-program / game files ===`：App 沙盒里名字带 `game/arrow/miniapp/level/puzzle` 的文件路径，方便定位小程序 JS 主包。
+侦察报告包含五块：
+
+- `=== All windows ===`：当前所有窗口（类名 / windowLevel / 是否 key / rootViewController），我们自己的覆盖层会标 `<-- OURS`。用来确认到底 dump 的是谁的界面。
+- `=== View hierarchy ===`：支付宝**主窗口**从根往下每一层 View 的类名和位置。用来判断游戏是原生 UIView、Cocos/Unity 的 GL 层、还是包在 WKWebView 里。
+- `=== Relevant Objective-C classes ===`：类名里带 `Nebula/TinyApp/MiniApp/Applet/H5WK/Cocos/Game/Canvas/Arrow/Grid/Puzzle/WebView/JSCore/Cube/XR` 的类（上限 400 条），是后续 hook 的候选。
+- `=== WebView probe ===`：**遍历 App 里每一个 WKWebView**（不只第一个），逐个输出类名/坐标/尺寸/评分，以及三层探测：
+  - `compact`：URL、title、frame 数、canvas 数、script 数、引擎特征（`cc`/`Laya`/`egret`/`PIXI`/`THREE`/`my`/`wx` 等）
+  - `frames`：各子 frame 的 URL
+  - `heavy`：**递归走 frame 树（top + 最多 4 个子 frame × 2 层）**，dump 所有名字像游戏状态的全局变量（带 JSON 值）、Cocos 场景树、**页面加载的 script 源地址**、以及**未过滤的 window 键名**（前 180 个）
+- `=== Sandbox directory tree ===`：`Library/Caches/H5CustomFiles`、`Documents/PYLFilemanager`、`Library/Caches` 的目录树（深度 3，带文件数与体积）。实际观测到的 `H5CustomFiles/usr/<uid>/gamecaches/` 结构和 `res/import/xx/`（Cocos 资源布局）就是从这里看出来的。
+- `=== Mini-program / game files ===`：旧版按关键词列文件，v3 已被上面的目录树取代。
+
+另外面板上的「导出缓存文本」会生成 `Documents/arrowgame_h5dump.txt`（最多 12 MB），内容是 H5 缓存里所有 js/json/html/text 的拼接，给我做离线逆向用。
 
 把这份报告发我之后，我就能判断该 hook 哪一层、数据从哪拿，然后升级求解版。
 
