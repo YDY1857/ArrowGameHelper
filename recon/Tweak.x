@@ -16,13 +16,54 @@
 
 static UIWindow *gReconWindow = nil;
 static UITextView *gReconTextView = nil;
+static UIWindow *gBadgeWindow = nil;
 
 // Overlay controller (implementation is further below)
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
 - (void)presentWithText:(NSString *)text;
 - (void)hide;
+// Floating badge: visible proof the dylib loaded + a reliable trigger.
+- (void)showBadge;
+- (void)installThreeFingerLongPress;
 @end
+
+// A root view that only captures touches which land on a real subview, so the
+// full-screen badge window lets everything else fall through to the app below.
+@interface PassthroughView : UIView
+@end
+
+@implementation PassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self) ? nil : hit;
+}
+@end
+
+// iOS 13+ rework: a UIWindow must be attached to the active UIWindowScene,
+// otherwise it is never shown in a scene-based app (like Alipay).
+static UIWindow *makeOverlayWindow(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    for (UIScene *s in app.connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]] &&
+            s.activationState == UISceneActivationStateForegroundActive) {
+            UIWindowScene *ws = (UIWindowScene *)s;
+            UIWindow *w = [[UIWindow alloc] initWithWindowScene:ws];
+            w.frame = ws.coordinateSpace.bounds;
+            return w;
+        }
+    }
+    // Fallback: attach to any window scene, else legacy init.
+    for (UIScene *s in app.connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)s;
+            UIWindow *w = [[UIWindow alloc] initWithWindowScene:ws];
+            w.frame = ws.coordinateSpace.bounds;
+            return w;
+        }
+    }
+    return [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+}
 
 // ---------------------------------------------------------------------------
 // Sandbox-safe output path
@@ -248,7 +289,7 @@ static void runRecon(void) {
 
 - (void)presentWithText:(NSString *)text {
     if (!gReconWindow) {
-        gReconWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        gReconWindow = makeOverlayWindow();
         gReconWindow.windowLevel = 10000; // above alert (2000)
         gReconWindow.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.92];
         UIViewController *root = [[UIViewController alloc] init];
@@ -314,6 +355,89 @@ static void runRecon(void) {
     [presenter presentViewController:avc animated:YES completion:nil];
 }
 
+#pragma mark - Floating badge (load proof + trigger)
+
+- (void)showBadge {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!gBadgeWindow) {
+            CGFloat side = 46;
+            gBadgeWindow = makeOverlayWindow();
+            gBadgeWindow.windowLevel = 10001;
+            gBadgeWindow.backgroundColor = [UIColor clearColor];
+            UIViewController *root = [[UIViewController alloc] init];
+            root.view = [[PassthroughView alloc] initWithFrame:gBadgeWindow.bounds];
+            root.view.backgroundColor = [UIColor clearColor];
+            root.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            gBadgeWindow.rootViewController = root;
+
+            CGSize sc = gBadgeWindow.bounds.size;
+            UILabel *badge = [[UILabel alloc] initWithFrame:CGRectMake(sc.width - side - 8, sc.height * 0.55, side, side)];
+            badge.text = @"RG";
+            badge.textAlignment = NSTextAlignmentCenter;
+            badge.font = [UIFont boldSystemFontOfSize:15];
+            badge.textColor = [UIColor whiteColor];
+            badge.backgroundColor = [UIColor colorWithRed:0.92 green:0.12 blue:0.12 alpha:0.78];
+            badge.layer.cornerRadius = side / 2;
+            badge.layer.masksToBounds = YES;
+            badge.userInteractionEnabled = YES;
+            badge.tag = 9001;
+            [root.view addSubview:badge];
+
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(badgeTapped)];
+            [badge addGestureRecognizer:tap];
+            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(badgePanned:)];
+            [badge addGestureRecognizer:pan];
+
+            [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                              object:nil
+                                                               queue:[NSOperationQueue mainQueue]
+                                                          usingBlock:^(NSNotification *note) {
+                [self installThreeFingerLongPress];
+            }];
+        }
+        gBadgeWindow.hidden = NO;
+        [self installThreeFingerLongPress];
+    });
+}
+
+- (void)badgeTapped {
+    if (gReconWindow && !gReconWindow.hidden) {
+        [self hide];
+    } else {
+        runRecon();
+    }
+}
+
+- (void)badgePanned:(UIPanGestureRecognizer *)gr {
+    UIView *badge = gr.view;
+    CGPoint t = [gr translationInView:badge.superview];
+    badge.center = CGPointMake(badge.center.x + t.x, badge.center.y + t.y);
+    [gr setTranslation:CGPointZero inView:badge.superview];
+}
+
+- (void)installThreeFingerLongPress {
+    static BOOL installed = NO;
+    if (installed) return;
+    UIWindow *w = getMainWindow();
+    if (!w) return;
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:self action:@selector(threeFingerLongPress:)];
+    lp.numberOfTouchesRequired = 3;
+    lp.minimumPressDuration = 0.4;
+    lp.cancelsTouchesInView = NO;
+    [w addGestureRecognizer:lp];
+    installed = YES;
+}
+
+- (void)threeFingerLongPress:(UILongPressGestureRecognizer *)gr {
+    if (gr.state != UIGestureRecognizerStateBegan) return;
+    if (gReconWindow && !gReconWindow.hidden) {
+        [self hide];
+    } else {
+        runRecon();
+    }
+}
+
 @end
 
 static void hideReconOverlay(void) {
@@ -355,4 +479,27 @@ static void ArrowGameReconInit(void) {
     } else {
         NSLog(@"[ArrowGameRecon] failed to find -[UIApplication sendEvent:]");
     }
+
+    // Write a marker file so we can tell the dylib actually loaded, then show
+    // the floating badge (visible proof + tap-to-run).
+    NSString *marker = [[reconFilePath() stringByDeletingLastPathComponent]
+                        stringByAppendingPathComponent:@"_recon_loaded.txt"];
+    NSString *info = [NSString stringWithFormat:@"loaded @ %@\nbundle=%@\nhooked=%s\n",
+                      [NSDate date], [NSBundle mainBundle].bundleIdentifier, m ? "yes" : "no"];
+    [info writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [[ReconOverlayController sharedInstance] showBadge];
+    });
+
+    // One-shot auto run ~8s after launch: if a report panel appears on its own,
+    // the whole chain (load + hook + window) is proven working.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        static BOOL ran = NO;
+        if (ran) return;
+        ran = YES;
+        runRecon();
+    });
 }
