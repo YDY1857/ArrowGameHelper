@@ -3,45 +3,69 @@
 #import <objc/runtime.h>
 
 // ============================================================================
-// ArrowGameRecon (non-jailbreak / re-signed IPA friendly version)
+// ArrowGameRecon — reconnaissance tweak for the Alipay arrow game
+// (non-jailbreak / re-signed IPA friendly: no Logos, no substrate)
 //
-// - No Logos, no CydiaSubstrate: the hook is installed with the Objective-C
-//   runtime directly, so the dylib loads in a re-signed app with no jailbreak
-//   runtime present.
-// - The report is written into the app's OWN sandbox (Documents) — the only
-//   place a non-jailbroken app is allowed to write.
+// v3 changes (2026-10-16):
+//   [BUGFIX] getMainWindow() used to pick a window by -isKeyWindow. Our own
+//     overlay window becomes key, so the whole view-hierarchy dump was our own
+//     RG badge and "No WKWebView detected" was meaningless. Own windows are now
+//     excluded, and every window is listed (class / level / root VC).
+//   [NEW] Directory tree dump of the interesting sandbox roots
+//     (Library/Caches/H5CustomFiles, Documents/PYLFilemanager).
+//   [NEW] Cocos-Creator-aware JS probes (window.cc / cc.director.getScene())
+//     plus canvas detection.
+//   [NEW] "导出缓存文本" button — concatenates every js/json/html/text file found
+//     under the H5 cache into ONE shareable .txt so the game code can be read
+//     offline. No zip/tar binary format involved, so nothing can corrupt.
+//   [KEEP] v2 touch-passthrough fix (ReconWindow) and the silent self-check.
 //
-// v2 changes (2026-10-16) — fixes "panel popped up and the whole app went dead":
-//   1. The overlay windows are now ReconWindow (a UIWindow subclass whose
-//      -hitTest: returns nil for empty areas). Root cause of the freeze: a
-//      plain UIWindow answers -hitTest: with *itself* when no subview claims
-//      the point, so the PassthroughView trick never actually fired and every
-//      touch was swallowed by the overlay window.
-//   2. The panel is no longer full-screen: it is a card that leaves a
-//      transparent strip at the bottom, and it has an explicit 关闭 button.
-//   3. The 8s launch self-check no longer hijacks the screen — it runs
-//      silently (writes the file only) and shows a 2.5s non-blocking toast.
-//   4. The "三指轻点关闭" hint is gone (three-finger tap is unreliable).
-//      Panel exit: tap 关闭, or tap the RG ball.
+// v4 changes (2026-10-16):
+//   [NEW] Recording mode. Tap "开始采集" while the game is on screen, then
+//     PLAY the game normally. A 1 Hz sampler records the JS/Cocos state every
+//     second, and every finger tap on the app is logged with its window
+//     coordinates and the hit-test view class. Result: a timeline that lets us
+//     line up "user tapped here" against "this node changed".
+//     The panel hides itself while recording so it does not block play, and the
+//     RG ball turns orange to show recording is live.
 // ============================================================================
 
 static UIWindow *gReconWindow = nil;
 static UITextView *gReconTextView = nil;
 static UIWindow *gBadgeWindow = nil;
+static UIButton *gSampleBtn = nil;
 
-// Overlay controller (implementation is further below)
+// --- sampling state -------------------------------------------------------
+static BOOL gSampling = NO;
+static NSInteger gSampleIdx = 0;
+static NSInteger gSessionNo = 0;
+static NSDate *gSessionStart = nil;
+static NSMutableArray *gTapLog = nil;
+static dispatch_source_t gSampleTimer = nil;
+static dispatch_queue_t gSampleQueue = nil;
+static const NSInteger kMaxSamples = 180;
+static const double kSampleInterval = 1.0;
+
+#define RECON_VERSION @"4"
+
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
 - (void)presentWithText:(NSString *)text;
 - (void)hide;
-// Floating badge: visible proof the dylib loaded + a reliable trigger.
 - (void)showBadge;
 - (void)showToast:(NSString *)msg;
 - (void)installThreeFingerLongPress;
+// Declared up front so calls made before the definition always resolve.
+- (void)sampleTick:(NSInteger)idx;
+- (void)startSampling;
+- (void)stopSamplingAndExport;
+- (void)updateSampleButton;
+- (void)updateBadgeLook;
+- (void)btnToggleSampling;
+- (void)togglePanel;
 @end
 
-// A root view that only captures touches which land on a real subview, so the
-// full-screen badge window lets everything else fall through to the app below.
+// Only captures touches that land on a real subview.
 @interface PassthroughView : UIView
 @end
 
@@ -52,14 +76,9 @@ static UIWindow *gBadgeWindow = nil;
 }
 @end
 
-// ---------------------------------------------------------------------------
-// The real fix for touch pass-through.
-//
-// A bare UIWindow returns *itself* from -hitTest: when no subview is hit, and a
-// touch delivered to a UIWindow goes nowhere — it does NOT continue down to the
-// windows below. Returning nil here is what lets an empty area of the overlay
-// reach the app underneath.
-// ---------------------------------------------------------------------------
+// A bare UIWindow answers -hitTest: with itself when no subview is hit, and a
+// touch delivered to a UIWindow goes nowhere. Returning nil here is what makes
+// touches on empty areas reach the app underneath.
 @interface ReconWindow : UIWindow
 @end
 
@@ -70,10 +89,18 @@ static UIWindow *gBadgeWindow = nil;
     if (hit && hit == self.rootViewController.view) return nil;
     return hit;
 }
+// Never steal key-window status from the app: otherwise the app's own window
+// stops being key, which breaks text input focus and also made the v2 dump pick
+// our overlay instead of the app's real window.
+- (BOOL)canBecomeKeyWindow {
+    return NO;
+}
 @end
 
-// iOS 13+ rework: a UIWindow must be attached to the active UIWindowScene,
-// otherwise it is never shown in a scene-based app (like Alipay).
+static BOOL isOwnWindow(UIWindow *w) {
+    return [w isKindOfClass:[ReconWindow class]];
+}
+
 static UIWindow *makeOverlayWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
     for (UIScene *s in app.connectedScenes) {
@@ -85,7 +112,6 @@ static UIWindow *makeOverlayWindow(void) {
             return w;
         }
     }
-    // Fallback: attach to any window scene, else legacy init.
     for (UIScene *s in app.connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]]) {
             UIWindowScene *ws = (UIWindowScene *)s;
@@ -97,41 +123,69 @@ static UIWindow *makeOverlayWindow(void) {
     return [[ReconWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
 }
 
-// ---------------------------------------------------------------------------
-// Sandbox-safe output path
-// ---------------------------------------------------------------------------
-static NSString *reconFilePath(void) {
+static NSString *sandboxDocs(void) {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    if (!docs) docs = NSHomeDirectory();
-    return [docs stringByAppendingPathComponent:@"arrowgame_recon.txt"];
+    return docs ?: NSHomeDirectory();
 }
 
-// iOS 13+: keyWindow is deprecated; use the scene API, fall back to runtime call.
-static UIWindow *getMainWindow(void) {
+static NSString *reconFilePath(void) {
+    return [sandboxDocs() stringByAppendingPathComponent:@"arrowgame_recon.txt"];
+}
+
+// Every window that is NOT ours. This is the fix for v2's useless dump.
+static NSArray<UIWindow *> *appWindows(void) {
+    NSMutableArray *result = [NSMutableArray array];
     UIApplication *app = [UIApplication sharedApplication];
-    NSSet<UIScene *> *scenes = app.connectedScenes;
-    for (UIScene *scene in scenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            UIWindowScene *ws = (UIWindowScene *)scene;
-            UIWindow *found = nil;
-            for (UIWindow *w in ws.windows) {
-                if (w.isKeyWindow) { found = w; break; }
-            }
-            if (!found) found = ws.windows.firstObject;
-            if (found) return found;
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)scene;
+        for (UIWindow *w in ws.windows) {
+            if (!isOwnWindow(w)) [result addObject:w];
         }
     }
-    SEL kw = NSSelectorFromString(@"keyWindow");
-    if ([app respondsToSelector:kw]) {
-        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:[app methodSignatureForSelector:kw]];
-        inv.target = app;
-        inv.selector = kw;
-        [inv invoke];
-        __unsafe_unretained UIWindow *win = nil;
-        [inv getReturnValue:&win];
-        return win;
+    return result;
+}
+
+// Prefer the key window among the app's own windows, else the biggest visible
+// normal-level window, else anything visible.
+static UIWindow *getMainWindow(void) {
+    NSArray<UIWindow *> *wins = appWindows();
+    for (UIWindow *w in wins) {
+        if (w.isKeyWindow && !w.hidden) return w;
     }
-    return nil;
+    UIWindow *best = nil;
+    for (UIWindow *w in wins) {
+        if (w.hidden) continue;
+        if (w.windowLevel != UIWindowLevelNormal) continue;
+        if (!best || w.frame.size.height > best.frame.size.height) best = w;
+    }
+    if (best) return best;
+    for (UIWindow *w in wins) {
+        if (!w.hidden) return w;
+    }
+    return wins.firstObject;
+}
+
+static NSString *dumpWindowList(void) {
+    NSMutableString *out = [NSMutableString stringWithString:@"\n=== All windows (ours marked) ===\n"];
+    UIApplication *app = [UIApplication sharedApplication];
+    NSInteger idx = 0;
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)scene;
+        for (UIWindow *w in ws.windows) {
+            [out appendFormat:@"[%ld] %@ level=%.0f hidden=%@ key=%@ rootVC=%@ frame=(%.0f,%.0f,%.0f,%.0f)%@\n",
+                (long)idx++,
+                NSStringFromClass([w class]),
+                w.windowLevel,
+                w.hidden ? @"YES" : @"NO",
+                w.isKeyWindow ? @"YES" : @"NO",
+                NSStringFromClass([w.rootViewController class]),
+                w.frame.origin.x, w.frame.origin.y, w.frame.size.width, w.frame.size.height,
+                isOwnWindow(w) ? @"   <-- OURS" : @""];
+        }
+    }
+    return out;
 }
 
 #pragma mark - View hierarchy dump
@@ -168,12 +222,15 @@ static NSString *dumpRelevantClasses(void) {
     if (numClasses <= 0) return outStr;
     Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
     numClasses = objc_getClassList(classes, numClasses);
-    NSArray *keywords = @[@"Arrow", @"Game", @"Level", @"Grid", @"Puzzle", @"Stage",
-                          @"Board", @"Sprite", @"Node", @"Scene", @"Canvas", @"MiniApp",
-                          @"TinyApp", @"H5", @"WebView", @"Render"];
+    NSArray *keywords = @[@"Nebula", @"TinyApp", @"MiniApp", @"Applet", @"Appx", @"H5WK",
+                          @"H5Custom", @"Cocos", @"Game", @"Canvas", @"Arrow", @"Grid",
+                          @"Puzzle", @"WebView", @"JSCore", @"Cube", @"XR"];
     NSInteger matched = 0;
-    for (int i = 0; i < numClasses; i++) {
+    for (int i = 0; i < numClasses && matched < 400; i++) {
         NSString *name = NSStringFromClass(classes[i]);
+        if (!name.length) continue;
+        // Skip Swift-mangled system noise and obvious unrelated frameworks.
+        if ([name hasPrefix:@"_"]) continue;
         for (NSString *kw in keywords) {
             if ([name rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound) {
                 [outStr appendFormat:@"%@\n", name];
@@ -183,25 +240,29 @@ static NSString *dumpRelevantClasses(void) {
         }
     }
     free(classes);
-    [outStr appendFormat:@"(matched %ld classes)\n", (long)matched];
+    [outStr appendFormat:@"(matched %ld classes, capped at 400)\n", (long)matched];
     return outStr;
 }
 
-#pragma mark - WKWebView JS probe
+#pragma mark - WKWebView probes
 
-// Plain recursive function (a recursive block would trip -Werror warnings).
-static WKWebView *findWKWebView(UIView *v) {
-    if (!v) return nil;
-    if ([v isKindOfClass:[WKWebView class]]) return (WKWebView *)v;
+static void findWKWebViews(UIView *v, NSMutableArray *into, NSInteger depth) {
+    if (!v || depth > 40) return;
+    if ([v isKindOfClass:[WKWebView class]]) [into addObject:v];
     for (UIView *sub in v.subviews) {
-        WKWebView *found = findWKWebView(sub);
-        if (found) return found;
+        findWKWebViews(sub, into, depth + 1);
     }
-    return nil;
 }
 
-// dispatch_sync onto the main queue DEADLOCKS if we are already on it. Always
-// go through this helper so probeWebView can never hang the app.
+static NSArray<WKWebView *> *allWKWebViews(void) {
+    NSMutableArray *found = [NSMutableArray array];
+    for (UIWindow *w in appWindows()) {
+        findWKWebViews(w, found, 0);
+    }
+    return found;
+}
+
+// dispatch_sync onto the main queue deadlocks if we are already on it.
 static void runOnMainSync(dispatch_block_t block) {
     if ([NSThread isMainThread]) {
         block();
@@ -210,111 +271,331 @@ static void runOnMainSync(dispatch_block_t block) {
     }
 }
 
-static NSString *probeWebView(WKWebView *webView) {
-    NSMutableString *result = [NSMutableString stringWithString:@""];
-
-    if (!webView) {
-        return @"\n=== WebView probe ===\nNo WKWebView detected (game is likely native or canvas).\n";
+static NSString *evalJS(WKWebView *webView, NSString *js, NSTimeInterval timeout) {
+    __block NSString *val = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    runOnMainSync(^{
+        [webView evaluateJavaScript:js completionHandler:^(id v, NSError *err) {
+            if (err) val = [@"ERR:" stringByAppendingString:err.localizedDescription];
+            else if (v == nil || [v isKindOfClass:[NSNull class]]) val = @"<null>";
+            else val = [v description];
+            dispatch_semaphore_signal(sem);
+        }];
+    });
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC))) != 0) {
+        return @"<timeout>";
     }
-
-    [result appendString:@"\n=== WebView probe ===\nDetected WKWebView surface.\n"];
-
-    NSArray *jsProbes = @[
-        @"typeof window!=='undefined'?Object.keys(window).filter(function(k){return /game|level|arrow|grid|puzzle|stage|board/i.test(k)}).join(','):'no-window'",
-        @"document&&document.body?document.body.innerText.slice(0,500):'no-body'",
-        @"(function(){var s='';for(var k in window){if(/game|level|arrow|grid|puzzle|stage|board/i.test(k)){try{s+=k+'='+JSON.stringify(window[k]).slice(0,200)+'\\n'}catch(e){s+=k+'=[unserializable]\\n'}}}return s})()"
-    ];
-
-    for (NSString *js in jsProbes) {
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        __block NSString *val = nil;
-        // WKWebView evaluateJavaScript must run on the main thread.
-        runOnMainSync(^{
-            [webView evaluateJavaScript:js completionHandler:^(id v, NSError *err) {
-                if (err) val = [@"ERR:" stringByAppendingString:err.localizedDescription];
-                else val = [v description];
-                dispatch_semaphore_signal(sem);
-            }];
-        });
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-        [result appendFormat:@"JS[%@] => %@\n", js, val];
-    }
-    return result;
+    return val ?: @"<nil>";
 }
 
-#pragma mark - Filesystem scan (inside the app sandbox)
+static NSString *probeWebView(WKWebView *webView) {
+    NSMutableString *r = [NSMutableString string];
+    if (!webView) {
+        [r appendString:@"\n=== WebView probe ===\nNo WKWebView found in the app's windows.\n"];
+        return r;
+    }
+    [r appendFormat:@"\n=== WebView probe ===\nURL: %@\nWKWebView subclass: %@\n",
+        webView.URL.absoluteString ?: @"<nil>", NSStringFromClass([webView class])];
 
-static NSString *scanMiniProgramFiles(void) {
-    NSMutableString *outStr = [NSMutableString stringWithString:@"\n=== Mini-program / game files ===\n"];
-    NSArray *dirs = @[
-        NSHomeDirectory(),
-        [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"],
-        [NSHomeDirectory() stringByAppendingPathComponent:@"Library"],
-        [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"],
-        [NSBundle mainBundle].bundlePath
+    NSArray *probes = @[
+        @"typeof cc",
+        @"(typeof cc!=='undefined'&&cc.director&&cc.director.getScene())?(cc.director.getScene().name+' | children='+cc.director.getScene().children.length):'no-cc-scene'",
+        @"(function(){if(typeof cc==='undefined'||!cc.director)return 'no-cc';var s=cc.director.getScene();if(!s)return 'no-scene';var o=[];function w(n,d){if(d>2||o.length>150)return;o.push(('  ').repeat(d)+n.name+' <'+(n.constructor&&n.constructor.name)+'>');var c=n.children||[];for(var i=0;i<c.length;i++)w(c[i],d+1);}w(s,0);return o.join('\\n')})()",
+        @"Object.keys(window).filter(function(k){return /game|level|arrow|grid|puzzle|stage|board|cc|scene/i.test(k)}).join(',')",
+        @"document.querySelectorAll('canvas').length+' canvas; scripts='+document.scripts.length+' title='+(document.title||'')",
+        @"document&&document.body?document.body.innerText.slice(0,400):'no-body'"
     ];
-    NSArray *exts = @[@"js", @"json", @"wasm", @"html", @"game", @"bundle"];
-    NSInteger found = 0;
-    for (NSString *dir in dirs) {
-        NSDirectoryEnumerator *en = [[NSFileManager defaultManager] enumeratorAtPath:dir];
-        NSString *file;
-        while ((file = [en nextObject]) && found < 300) {
-            NSString *lower = [file lowercaseString];
-            BOOL match = NO;
-            for (NSString *ext in exts) {
-                if ([lower hasSuffix:[@"." stringByAppendingString:ext]]) match = YES;
-            }
-            if (match && ([lower containsString:@"game"] || [lower containsString:@"arrow"] ||
-                         [lower containsString:@"miniapp"] || [lower containsString:@"tinyapp"] ||
-                         [lower containsString:@"level"] || [lower containsString:@"puzzle"] ||
-                         [lower hasSuffix:@".game"])) {
-                [outStr appendFormat:@"%@/%@\n", dir, file];
-                found++;
-            }
+
+    for (NSString *js in probes) {
+        [r appendFormat:@"JS[%@] =>\n%@\n---\n", js, evalJS(webView, js, 3.0)];
+    }
+    return r;
+}
+
+#pragma mark - Sandbox directory tree
+
+static void treeRecurse(NSString *root, NSString *rel, NSInteger depth, NSInteger maxDepth,
+                        NSMutableString *out, NSInteger *lines) {
+    if (*lines > 400 || depth > maxDepth) return;
+    NSString *dir = rel.length ? [root stringByAppendingPathComponent:rel] : root;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    if (!items) return;
+
+    unsigned long long totalBytes = 0;
+    NSMutableArray *subdirs = [NSMutableArray array];
+    NSMutableArray *files = [NSMutableArray array];
+    for (NSString *it in items) {
+        NSString *full = [dir stringByAppendingPathComponent:it];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) {
+            [subdirs addObject:it];
+        } else {
+            NSDictionary *a = [fm attributesOfItemAtPath:full error:NULL];
+            totalBytes += [a[NSFileSize] unsignedLongLongValue];
+            [files addObject:it];
         }
     }
-    [outStr appendFormat:@"(found %ld candidate files)\n", (long)found];
-    return outStr;
+
+    NSMutableString *indent = [NSMutableString string];
+    for (NSInteger i = 0; i < depth; i++) [indent appendString:@"  "];
+    [out appendFormat:@"%@%@/  (%lu files, %.1f KB)\n",
+        indent, rel.length ? rel : @"<root>",
+        (unsigned long)files.count, totalBytes / 1024.0];
+    (*lines)++;
+
+    if (depth >= maxDepth) {
+        NSInteger shown = 0;
+        for (NSString *f in [files sortedArrayUsingSelector:@selector(compare:)]) {
+            if (shown >= 8) break;
+            [out appendFormat:@"%@  - %@\n", indent, f];
+            (*lines)++; shown++;
+        }
+        if ((NSInteger)files.count > shown) {
+            [out appendFormat:@"%@  ... (%ld more)\n", indent, (long)(files.count - shown)];
+            (*lines)++;
+        }
+        return;
+    }
+    for (NSString *sd in [subdirs sortedArrayUsingSelector:@selector(compare:)]) {
+        NSString *childRel = rel.length ? [rel stringByAppendingPathComponent:sd] : sd;
+        treeRecurse(root, childRel, depth + 1, maxDepth, out, lines);
+    }
+}
+
+static NSString *dumpSandboxTrees(void) {
+    NSMutableString *out = [NSMutableString stringWithString:@"\n=== Sandbox directory tree ===\n"];
+    NSArray *roots = @[
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/H5CustomFiles"],
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/PYLFilemanager"],
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"]
+    ];
+    NSArray *depths = @[@3, @3, @1];
+    for (NSInteger i = 0; i < (NSInteger)roots.count; i++) {
+        NSInteger lines = 0;
+        [out appendFormat:@"\n--- %@ ---\n", roots[i]];
+        treeRecurse(roots[i], @"", 0, [depths[i] integerValue], out, &lines);
+    }
+    return out;
+}
+
+#pragma mark - Text dump of the H5 cache (shareable as ONE .txt)
+
+static NSString *h5DumpPath(void) {
+    return [sandboxDocs() stringByAppendingPathComponent:@"arrowgame_h5dump.txt"];
+}
+
+static NSString *buildTextDump(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *path = h5DumpPath();
+    [fm removeItemAtPath:path error:NULL];
+    [fm createFileAtPath:path contents:nil attributes:nil];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) return nil;
+
+    NSArray *roots = @[
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/H5CustomFiles"],
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/PYLFilemanager"]
+    ];
+    NSSet *exts = [NSSet setWithArray:@[@"js", @"json", @"html", @"htm", @"txt", @"plist",
+                                        @"xml", @"css", @"ts", @"map", @"wxml", @"wxss", @"vue"]];
+    NSArray *skipParts = @[@"res/native/", @"/tmp/", @".tmp/", @"/.cache/"];
+
+    const unsigned long long kCap = 12ULL * 1024 * 1024;
+    const unsigned long long kMaxFile = 2ULL * 1024 * 1024;
+    unsigned long long total = 0;
+    NSInteger taken = 0, skippedExt = 0, skippedBig = 0, skippedBin = 0;
+
+    for (NSString *root in roots) {
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+        NSString *rel;
+        while ((rel = [en nextObject])) {
+            if (total >= kCap) break;
+            NSString *full = [root stringByAppendingPathComponent:rel];
+            NSString *low = [full lowercaseString];
+            BOOL skip = NO;
+            for (NSString *sp in skipParts) {
+                if ([low rangeOfString:sp].location != NSNotFound) { skip = YES; break; }
+            }
+            if (skip) continue;
+
+            NSString *ext = [full pathExtension].lowercaseString;
+            if (![exts containsObject:ext]) { skippedExt++; continue; }
+
+            NSDictionary *a = [fm attributesOfItemAtPath:full error:NULL];
+            if (!a) continue;
+            unsigned long long sz = [a[NSFileSize] unsignedLongLongValue];
+            if (sz == 0 || sz > kMaxFile) { skippedBig++; continue; }
+            if (total + sz > kCap) continue;
+
+            NSData *d = [NSData dataWithContentsOfFile:full];
+            if (!d) continue;
+            NSString *txt = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+            if (!txt) { skippedBin++; continue; }
+
+            [fh writeData:[[NSString stringWithFormat:@"\n\n===== FILE: %@ (%llu bytes) =====\n", full, sz]
+                           dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh writeData:d];
+            total += sz;
+            taken++;
+        }
+    }
+
+    NSString *summary = [NSString stringWithFormat:
+        "===== ArrowGameRecon H5 text dump =====\n"
+        "version: %@\ndate: %@\n"
+        "included files: %ld\ntotal bytes: %llu (cap 12 MB)\n"
+        "skipped (extension): %ld\nskipped (>2MB): %ld\nskipped (binary): %ld\n"
+        "Tip: search this file for 'arrow', 'level', 'direction', 'grid', 'config'.\n",
+        RECON_VERSION, [NSDate date], (long)taken, total,
+        (long)skippedExt, (long)skippedBig, (long)skippedBin];
+    [fh writeData:[summary dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+    return path;
+}
+
+#pragma mark - Recording mode (sample the game while the user plays)
+
+static NSString *samplesFilePath(void) {
+    return [sandboxDocs() stringByAppendingPathComponent:@"arrowgame_samples.txt"];
+}
+
+static void appendTextToFile(NSString *path, NSString *text) {
+    if (!text.length) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        [fm createFileAtPath:path contents:nil attributes:nil];
+    }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) return;
+    @try {
+        [fh seekToEndOfFile];
+        [fh writeData:[text dataUsingEncoding:NSUTF8StringEncoding]];
+    } @catch (NSException *e) {
+        NSLog(@"[ArrowGameRecon] append failed: %@", e);
+    } @finally {
+        [fh closeFile];
+    }
+}
+
+// One compact JS snapshot. Globals are only re-scanned every few samples
+// because they rarely change and they are the bulkiest part.
+static NSString *sampleJS(BOOL includeGlobals) {
+    NSMutableString *js = [NSMutableString string];
+    [js appendString:@"(function(){var o={};"];
+    [js appendString:@"try{o.url=String(location.href).slice(0,200)}catch(e){}"];
+    [js appendString:@"try{o.title=String(document.title||'').slice(0,120)}catch(e){}"];
+    [js appendString:@"try{o.canvas=document.querySelectorAll('canvas').length}catch(e){}"];
+    [js appendString:@"try{var c=document.querySelector('canvas');if(c)o.canvasSize=c.width+'x'+c.height}catch(e){}"];
+    [js appendString:@"try{if(typeof cc!=='undefined'&&cc.director&&cc.director.getScene()){"];
+    [js appendString:@"var s=cc.director.getScene(),out=[],n=0;"];
+    [js appendString:@"function walk(nd,d){if(d>4||n>350)return;n++;var p=nd.position||{};"];
+    [js appendString:@"out.push(new Array(d+1).join('  ')+nd.name+' <'+(nd.constructor&&nd.constructor.name)+'> xy='"];
+    [js appendString:@"+Math.round(p.x||0)+','+Math.round(p.y||0)+' act='+(nd.active===false?0:1)"];
+    [js appendString:@"+' op='+(nd.opacity===undefined?'-':nd.opacity)+' sc='+(nd.scaleX===undefined?'-':nd.scaleX));"];
+    [js appendString:@"var ch=nd.children||[];for(var i=0;i<ch.length;i++)walk(ch[i],d+1);}"];
+    [js appendString:@"walk(s,0);o.ccScene=s.name+' nodes='+n;o.ccTree=out.join('\\n');"];
+    [js appendString:@"}else{o.cc='none'}}catch(e){o.ccErr=String(e)}"];
+    if (includeGlobals) {
+        [js appendString:@"try{var g=[],skip=/^(top|window|self|document|location|navigator|history|screen|frames|parent|localStorage|sessionStorage|indexedDB|crypto|performance|console|JSON|Math|Date|Array|Object|String|Number|Boolean|RegExp|Error|Promise|Map|Set|Symbol|Proxy|Reflect|Intl|WebAssembly|globalThis)$/;"];
+        [js appendString:@"for(var k in window){if(skip.test(k))continue;var v;"];
+        [js appendString:@"try{v=window[k]}catch(e){continue}var t=typeof v;"];
+        [js appendString:@"if(t==='function'){if(/game|level|arrow|grid|puzzle|scene|data|state|model|app|cc/i.test(k))g.push(k+'=fn');continue;}"];
+        [js appendString:@"if(t!=='object'&&t!=='string'&&t!=='number'&&t!=='boolean')continue;"];
+        [js appendString:@"var sv='';try{sv=JSON.stringify(v)}catch(e){sv='[circ]'}"];
+        [js appendString:@"if(sv===undefined)sv='[undef]';if(sv.length>400)sv=sv.slice(0,400)+'...';"];
+        [js appendString:@"g.push(k+'='+sv);if(g.length>100)break;}"];
+        [js appendString:@"o.globals=g.join('\\n')}catch(e){o.gErr=String(e)}"];
+    }
+    [js appendString:@"return JSON.stringify(o);})()"];
+    return js;
+}
+
+// Windows + full view tree of the app's main window.
+static NSString *snapshotFullState(void) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendString:dumpWindowList()];
+    UIWindow *keyWin = getMainWindow();
+    [s appendFormat:@"\n--- View hierarchy (%@) ---\n",
+        keyWin ? NSStringFromClass([keyWin class]) : @"<none>"];
+    gNodeCount = 0;
+    if (keyWin) {
+        dumpView(keyWin, 0, s);
+    } else {
+        [s appendString:@"No app window found.\n"];
+    }
+    return s;
+}
+
+// Runs on the sampler queue. Returns the text block for one sample.
+static NSString *captureSampleNow(NSInteger idx) {
+    NSDate *t0 = [NSDate date];
+
+    __block WKWebView *wv = nil;
+    __block NSUInteger wvCount = 0;
+    runOnMainSync(^{
+        NSArray<WKWebView *> *all = allWKWebViews();
+        wvCount = all.count;
+        wv = all.firstObject;
+    });
+
+    NSString *jsOut = wv ? evalJS(wv, sampleJS(idx % 5 == 0), 2.0) : @"<no-webview>";
+
+    NSMutableArray *taps = nil;
+    @synchronized(gTapLog) {
+        taps = [gTapLog copy];
+        [gTapLog removeAllObjects];
+    }
+
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"\n----- SAMPLE %ld | +%.2fs | %@ -----\n",
+        (long)idx,
+        gSessionStart ? [t0 timeIntervalSinceDate:gSessionStart] : 0.0,
+        t0];
+    [s appendFormat:@"webview=%@ count=%lu\n",
+        wv ? NSStringFromClass([wv class]) : @"<none>",
+        (unsigned long)wvCount];
+    if (taps.count) {
+        [s appendFormat:@"TAPS:\n  %@\n", [taps componentsJoinedByString:@"\n  "]];
+    }
+    [s appendFormat:@"JS: %@\n", jsOut];
+    return s;
 }
 
 #pragma mark - Run recon
-//
-// showPanel == NO  -> silent run: write the file, show a short toast, no panel.
-// showPanel == YES -> show the report card on screen.
 
 static void runRecon(BOOL showPanel) {
-    // Called on the main thread, so capture UI synchronously.
     NSMutableString *report = [NSMutableString string];
-    [report appendFormat:@"ArrowGameRecon report @ %@\n", [NSDate date]];
+    [report appendFormat:@"ArrowGameRecon report v%@ @ %@\n", RECON_VERSION, [NSDate date]];
     [report appendFormat:@"App bundle: %@\n", [NSBundle mainBundle].bundleIdentifier];
     [report appendFormat:@"Trigger: %@\n", showPanel ? @"manual (panel shown)" : @"launch self-check (silent)"];
 
-    UIWindow *keyWin = getMainWindow();
+    [report appendString:dumpWindowList()];
 
+    UIWindow *keyWin = getMainWindow();
     gNodeCount = 0;
-    [report appendString:@"\n=== View hierarchy (keyWindow) ===\n"];
+    [report appendFormat:@"\n=== View hierarchy (main window: %@) ===\n",
+        keyWin ? NSStringFromClass([keyWin class]) : @"<none>"];
     if (keyWin) {
         dumpView(keyWin, 0, report);
     } else {
-        [report appendString:@"No key window found.\n"];
+        [report appendString:@"No app window found.\n"];
     }
 
-    // Resolve the WKWebView on the main thread (view traversal off-main is unsafe).
-    WKWebView *webView = keyWin ? findWKWebView(keyWin) : nil;
+    // Collect the web views on the main thread (view traversal off-main is unsafe).
+    NSArray<WKWebView *> *wes = allWKWebViews();
+    WKWebView *webView = wes.firstObject;
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [report appendFormat:@"\n=== WKWebView count in app windows: %lu ===\n", (unsigned long)wes.count];
         [report appendString:dumpRelevantClasses()];
         [report appendString:probeWebView(webView)];
-        [report appendString:scanMiniProgramFiles()];
+        [report appendString:dumpSandboxTrees()];
 
         NSString *path = reconFilePath();
         NSError *err = nil;
         [report writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-        if (err) {
-            NSLog(@"[ArrowGameRecon] write error: %@", err);
-        } else {
-            NSLog(@"[ArrowGameRecon] report written to %@", path);
-        }
+        NSLog(@"[ArrowGameRecon] report %@ (%@)", err ? @"FAILED" : @"written", path);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             ReconOverlayController *c = [ReconOverlayController sharedInstance];
@@ -341,7 +622,7 @@ static void runRecon(BOOL showPanel) {
 - (void)presentWithText:(NSString *)text {
     if (!gReconWindow) {
         gReconWindow = makeOverlayWindow();
-        gReconWindow.windowLevel = 10000; // above alert (2000)
+        gReconWindow.windowLevel = 10000;
         gReconWindow.backgroundColor = [UIColor clearColor];
 
         UIViewController *root = [[UIViewController alloc] init];
@@ -353,8 +634,6 @@ static void runRecon(BOOL showPanel) {
         CGFloat w = root.view.bounds.size.width;
         CGFloat h = root.view.bounds.size.height;
 
-        // Card instead of full screen: the strip at the bottom stays see-through
-        // so you can see the app is still alive and reach it.
         CGFloat cardX = 10.0, cardY = 46.0;
         CGFloat cardW = w - 20.0, cardH = h - cardY - 96.0;
         UIView *card = [[UIView alloc] initWithFrame:CGRectMake(cardX, cardY, cardW, cardH)];
@@ -364,58 +643,74 @@ static void runRecon(BOOL showPanel) {
         card.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [root.view addSubview:card];
 
-        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, cardW - 28, 20)];
-        title.text = @"ArrowGameRecon · 侦察报告";
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 7, cardW - 28, 20)];
+        title.text = [NSString stringWithFormat:@"ArrowGameRecon v%@ · 侦察报告", RECON_VERSION];
         title.textColor = [UIColor whiteColor];
         title.font = [UIFont boldSystemFontOfSize:13];
-        title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
         [card addSubview:title];
 
-        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(14, 27, cardW - 28, 15)];
-        hint.text = @"退出：点「关闭」，或点屏幕上的 RG 小球。下半屏仍可正常操作 App";
+        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(14, 25, cardW - 28, 15)];
+        hint.text = @"退出：点「关闭」或点 RG 小球。下半屏仍可操作 App";
         hint.textColor = [UIColor colorWithWhite:0.68 alpha:1.0];
         hint.font = [UIFont systemFontOfSize:10];
-        hint.autoresizingMask = UIViewAutoresizingFlexibleWidth;
         [card addSubview:hint];
 
-        // Three buttons: 关闭 / 复制全部 / 分享 / 存文件
-        CGFloat by = 46.0, bh = 32.0, gap = 6.0, pad = 8.0;
-        CGFloat bw = (cardW - pad * 2 - gap * 2) / 3.0;
+        CGFloat pad = 8.0, gap = 6.0, bh = 32.0;
+        CGFloat bw = (cardW - pad * 2 - gap) / 2.0;
+        CGFloat row1 = 45.0, row2 = row1 + bh + gap;
 
         UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        closeBtn.frame = CGRectMake(pad, by, bw, bh);
+        closeBtn.frame = CGRectMake(pad, row1, bw, bh);
         [closeBtn setTitle:@"关闭" forState:UIControlStateNormal];
         [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         closeBtn.backgroundColor = [UIColor colorWithRed:0.72 green:0.20 blue:0.20 alpha:1.0];
         closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
         closeBtn.layer.cornerRadius = 7;
-        closeBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleRightMargin;
         [closeBtn addTarget:self action:@selector(btnClose) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:closeBtn];
 
         UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        copyBtn.frame = CGRectMake(pad + bw + gap, by, bw, bh);
-        [copyBtn setTitle:@"复制全部" forState:UIControlStateNormal];
+        copyBtn.frame = CGRectMake(pad + bw + gap, row1, bw, bh);
+        [copyBtn setTitle:@"复制报告" forState:UIControlStateNormal];
         [copyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         copyBtn.backgroundColor = [UIColor colorWithRed:0.11 green:0.55 blue:0.40 alpha:1.0];
         copyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
         copyBtn.layer.cornerRadius = 7;
-        copyBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
         [copyBtn addTarget:self action:@selector(btnCopy) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:copyBtn];
 
         UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        shareBtn.frame = CGRectMake(pad + (bw + gap) * 2, by, bw, bh);
-        [shareBtn setTitle:@"分享 / 存文件" forState:UIControlStateNormal];
+        shareBtn.frame = CGRectMake(pad, row2, bw, bh);
+        [shareBtn setTitle:@"分享报告" forState:UIControlStateNormal];
         [shareBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        shareBtn.backgroundColor = [UIColor colorWithRed:0.30 green:0.34 blue:0.38 alpha:1.0];
-        shareBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        shareBtn.backgroundColor = [UIColor colorWithRed:0.24 green:0.34 blue:0.52 alpha:1.0];
+        shareBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
         shareBtn.layer.cornerRadius = 7;
-        shareBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleLeftMargin;
         [shareBtn addTarget:self action:@selector(btnShare) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:shareBtn];
 
-        CGFloat ty = by + bh + 8.0;
+        UIButton *dumpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        dumpBtn.frame = CGRectMake(pad + bw + gap, row2, bw, bh);
+        [dumpBtn setTitle:@"导出缓存文本" forState:UIControlStateNormal];
+        [dumpBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        dumpBtn.backgroundColor = [UIColor colorWithRed:0.62 green:0.40 blue:0.10 alpha:1.0];
+        dumpBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        dumpBtn.layer.cornerRadius = 7;
+        [dumpBtn addTarget:self action:@selector(btnExportDump) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:dumpBtn];
+
+        // Row 3: full-width recording toggle
+        CGFloat row3 = row2 + bh + gap;
+        gSampleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        gSampleBtn.frame = CGRectMake(pad, row3, cardW - pad * 2, bh);
+        [gSampleBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        gSampleBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        gSampleBtn.layer.cornerRadius = 7;
+        [gSampleBtn addTarget:self action:@selector(btnToggleSampling) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:gSampleBtn];
+        [self updateSampleButton];
+
+        CGFloat ty = row3 + bh + 8.0;
         gReconTextView = [[UITextView alloc] initWithFrame:CGRectMake(pad, ty, cardW - pad * 2, cardH - ty - pad)];
         gReconTextView.editable = NO;
         gReconTextView.font = [UIFont fontWithName:@"Menlo" size:9];
@@ -433,41 +728,202 @@ static void runRecon(BOOL showPanel) {
     if (gReconWindow) gReconWindow.hidden = YES;
 }
 
+- (UIViewController *)presenter {
+    UIViewController *vc = [getMainWindow() rootViewController];
+    if (vc) return vc;
+    return gReconWindow.rootViewController;
+}
+
+- (void)presentActivityWithItems:(NSArray *)items {
+    UIViewController *p = [self presenter];
+    if (!p) return;
+    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:items
+                                                                    applicationActivities:nil];
+    avc.popoverPresentationController.sourceView = gReconWindow;
+    [p presentViewController:avc animated:YES completion:nil];
+}
+
 - (void)btnClose {
     [self hide];
+}
+
+// Tap-the-ball / three-finger behaviour: hide if visible; if we are recording
+// and the panel is hidden, just bring it back (re-running a full recon here
+// would make the user wait two seconds before they can hit "stop").
+- (void)togglePanel {
+    if (gReconWindow && !gReconWindow.hidden) {
+        [self hide];
+    } else if (gReconWindow && gSampling) {
+        gReconWindow.hidden = NO;
+        [self updateSampleButton];
+    } else {
+        runRecon(YES);
+    }
 }
 
 - (void)btnCopy {
     if (gReconTextView.text.length) {
         [UIPasteboard generalPasteboard].string = gReconTextView.text;
-        [self showToast:@"已复制到剪贴板"];
+        [self showToast:@"报告已复制到剪贴板"];
     }
 }
 
 - (void)btnShare {
     NSString *path = reconFilePath();
-    UIViewController *presenter = [getMainWindow() rootViewController] ?: gReconWindow.rootViewController;
-    if (!presenter) return;
-    UIActivityViewController *avc = nil;
     if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        avc = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
-                                                applicationActivities:nil];
+        [self presentActivityWithItems:@[[NSURL fileURLWithPath:path]]];
     } else {
-        avc = [[UIActivityViewController alloc] initWithActivityItems:@[gReconTextView.text ?: @""]
-                                                applicationActivities:nil];
+        [self presentActivityWithItems:@[gReconTextView.text ?: @""]];
     }
-    avc.popoverPresentationController.sourceView = gReconWindow;
-    [presenter presentViewController:avc animated:YES completion:nil];
 }
 
-#pragma mark - Floating badge (load proof + trigger)
+// Build a single .txt containing every js/json/html/text file in the H5 cache,
+// then hand it to the share sheet. All of it happens on a background queue.
+- (void)btnExportDump {
+    [self showToast:@"正在导出缓存文本…"];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *path = buildTextDump();
+        unsigned long long size = 0;
+        if (path) {
+            NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+            size = [a[NSFileSize] unsignedLongLongValue];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (path && size > 0) {
+                [self showToast:[NSString stringWithFormat:@"已导出 %.1f MB，正在打开分享…", size / 1048576.0]];
+                [self presentActivityWithItems:@[[NSURL fileURLWithPath:path]]];
+            } else {
+                [self showToast:@"导出失败：H5 缓存里没有可读文本文件"];
+            }
+        });
+    });
+}
 
-// MUST be called on the main thread.
+#pragma mark - Recording: start / stop
+
+- (void)btnToggleSampling {
+    if (gSampling) {
+        [self stopSamplingAndExport];
+    } else {
+        [self startSampling];
+    }
+}
+
+- (void)updateSampleButton {
+    if (!gSampleBtn) return;
+    if (gSampling) {
+        [gSampleBtn setTitle:[NSString stringWithFormat:@"停止并导出 · 已采 %ld 次", (long)gSampleIdx]
+                    forState:UIControlStateNormal];
+        gSampleBtn.backgroundColor = [UIColor colorWithRed:0.78 green:0.33 blue:0.10 alpha:1.0];
+    } else {
+        [gSampleBtn setTitle:@"开始采集（先进关卡，再点这里）" forState:UIControlStateNormal];
+        gSampleBtn.backgroundColor = [UIColor colorWithRed:0.18 green:0.46 blue:0.26 alpha:1.0];
+    }
+}
+
+- (void)updateBadgeLook {
+    UIView *badge = [gBadgeWindow.rootViewController.view viewWithTag:9001];
+    if (![badge isKindOfClass:[UILabel class]]) return;
+    UILabel *b = (UILabel *)badge;
+    if (gSampling) {
+        b.text = @"REC";
+        b.font = [UIFont boldSystemFontOfSize:12];
+        b.backgroundColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.05 alpha:0.92];
+    } else {
+        b.text = @"RG";
+        b.font = [UIFont boldSystemFontOfSize:15];
+        b.backgroundColor = [UIColor colorWithRed:0.92 green:0.12 blue:0.12 alpha:0.78];
+    }
+}
+
+- (void)startSampling {
+    if (gSampling) return;
+    if (!gTapLog) gTapLog = [NSMutableArray array];
+
+    gSampling = YES;
+    gSampleIdx = 0;
+    gSessionNo++;
+    gSessionStart = [NSDate date];
+    @synchronized(gTapLog) { [gTapLog removeAllObjects]; }
+
+    NSMutableString *head = [NSMutableString string];
+    [head appendFormat:@"\n\n########## SESSION %ld START @ %@ (interval %.1fs, max %ld) ##########\n",
+        (long)gSessionNo, gSessionStart, kSampleInterval, (long)kMaxSamples];
+    [head appendString:snapshotFullState()];
+    appendTextToFile(samplesFilePath(), head);
+
+    if (gSampleTimer) {
+        dispatch_source_cancel(gSampleTimer);
+        gSampleTimer = nil;
+    }
+    gSampleQueue = dispatch_queue_create("arrowgame.recon.sample", DISPATCH_QUEUE_SERIAL);
+    gSampleTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gSampleQueue);
+    dispatch_source_set_timer(gSampleTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 0),
+                              (uint64_t)(kSampleInterval * NSEC_PER_SEC),
+                              (uint64_t)(0.05 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(gSampleTimer, ^{
+        if (!gSampling) return;
+        NSInteger idx = gSampleIdx++;
+        NSString *block = captureSampleNow(idx);
+        appendTextToFile(samplesFilePath(), block);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[ReconOverlayController sharedInstance] sampleTick:idx];
+        });
+    });
+    dispatch_resume(gSampleTimer);
+
+    [self updateSampleButton];
+    [self updateBadgeLook];
+    [self hide];   // get out of the way so the game stays playable
+    [self showToast:@"采样中（小球变橙色）：去玩几局，玩完点小球 → 停止并导出"];
+    NSLog(@"[ArrowGameRecon] sampling started, session %ld", (long)gSessionNo);
+}
+
+- (void)sampleTick:(NSInteger)idx {
+    [self updateSampleButton];
+    if (idx + 1 >= kMaxSamples) {
+        [self stopSamplingAndExport];
+    }
+}
+
+- (void)stopSamplingAndExport {
+    if (!gSampling) return;
+    gSampling = NO;
+    if (gSampleTimer) {
+        dispatch_source_cancel(gSampleTimer);
+        gSampleTimer = nil;
+    }
+    gSampleQueue = nil;
+
+    NSMutableString *foot = [NSMutableString string];
+    [foot appendString:snapshotFullState()];
+    [foot appendFormat:@"\n########## SESSION %ld END @ %@ (samples=%ld) ##########\n",
+        (long)gSessionNo, [NSDate date], (long)gSampleIdx];
+    appendTextToFile(samplesFilePath(), foot);
+
+    [self updateSampleButton];
+    [self updateBadgeLook];
+
+    NSString *path = samplesFilePath();
+    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    double mb = [a[NSFileSize] unsignedLongLongValue] / 1048576.0;
+    [self showToast:[NSString stringWithFormat:@"采样结束：%ld 次，%.2f MB。正在打开分享…",
+                     (long)gSampleIdx, mb]];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self presentActivityWithItems:@[[NSURL fileURLWithPath:path]]];
+    });
+    NSLog(@"[ArrowGameRecon] sampling stopped, %ld samples -> %@", (long)gSampleIdx, path);
+}
+
+#pragma mark - Floating badge
+
 - (void)ensureBadgeOnMain {
     if (!gBadgeWindow) {
         CGFloat side = 46;
         gBadgeWindow = makeOverlayWindow();
-        gBadgeWindow.windowLevel = 10001; // above the report card
+        gBadgeWindow.windowLevel = 10001;
         gBadgeWindow.backgroundColor = [UIColor clearColor];
         UIViewController *root = [[UIViewController alloc] init];
         root.view = [[PassthroughView alloc] initWithFrame:gBadgeWindow.bounds];
@@ -509,7 +965,6 @@ static void runRecon(BOOL showPanel) {
     dispatch_async(dispatch_get_main_queue(), ^{ [self ensureBadgeOnMain]; });
 }
 
-// Short, non-blocking confirmation banner. Never intercepts touches.
 - (void)showToast:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self ensureBadgeOnMain];
@@ -538,11 +993,7 @@ static void runRecon(BOOL showPanel) {
 }
 
 - (void)badgeTapped {
-    if (gReconWindow && !gReconWindow.hidden) {
-        [self hide];
-    } else {
-        runRecon(YES);
-    }
+    [self togglePanel];
 }
 
 - (void)badgePanned:(UIPanGestureRecognizer *)gr {
@@ -568,18 +1019,10 @@ static void runRecon(BOOL showPanel) {
 
 - (void)threeFingerLongPress:(UILongPressGestureRecognizer *)gr {
     if (gr.state != UIGestureRecognizerStateBegan) return;
-    if (gReconWindow && !gReconWindow.hidden) {
-        [self hide];
-    } else {
-        runRecon(YES);
-    }
+    [self togglePanel];
 }
 
 @end
-
-static void hideReconOverlay(void) {
-    [[ReconOverlayController sharedInstance] hide];
-}
 
 #pragma mark - Hook via Objective-C runtime (no substrate)
 
@@ -590,6 +1033,30 @@ static void reconSendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
         ((void (*)(id, SEL, id))gOrigSendEvent)(self, _cmd, event);
     }
     if (event.type != UIEventTypeTouches) return;
+
+    // Recording mode: log every finger-up that landed on the app's own UI, with
+    // the hit-test view class — this is what lets us line a tap up against the
+    // state change it caused.
+    if (gSampling && gTapLog) {
+        NSMutableArray *recs = nil;
+        for (UITouch *t in event.allTouches) {
+            if (t.phase != UITouchPhaseEnded) continue;
+            UIWindow *tw = t.window;
+            if (!tw || isOwnWindow(tw)) continue;
+            CGPoint p = [t locationInView:nil];
+            if (!recs) recs = [NSMutableArray array];
+            [recs addObject:[NSString stringWithFormat:
+                @"%.3f TAP(%.0f,%.0f) tapCount=%ld view=%@ win=%@",
+                [[NSDate date] timeIntervalSince1970], p.x, p.y,
+                (long)t.tapCount,
+                t.view ? NSStringFromClass([t.view class]) : @"<nil>",
+                NSStringFromClass([tw class])]];
+        }
+        if (recs.count) {
+            @synchronized(gTapLog) { [gTapLog addObjectsFromArray:recs]; }
+        }
+    }
+
     NSSet *touches = event.allTouches;
     if (touches.count != 3) return;
     BOOL allThreeFingerTap = YES;
@@ -598,14 +1065,7 @@ static void reconSendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
     }
     if (!allThreeFingerTap) return;
 
-    // Three-finger tap is kept as a bonus trigger only — it is unreliable
-    // (three fingers rarely all sit in the Ended phase at the same instant),
-    // which is why the panel now has its own 关闭 button.
-    if (gReconWindow && !gReconWindow.hidden) {
-        hideReconOverlay();
-    } else {
-        runRecon(YES);
-    }
+    [[ReconOverlayController sharedInstance] togglePanel];
 }
 
 __attribute__((constructor))
@@ -616,16 +1076,13 @@ static void ArrowGameReconInit(void) {
         gOrigSendEvent = method_getImplementation(m);
         method_setImplementation(m, (IMP)reconSendEvent);
         NSLog(@"[ArrowGameRecon] sendEvent: hooked (no substrate)");
-    } else {
-        NSLog(@"[ArrowGameRecon] failed to find -[UIApplication sendEvent:]");
     }
 
-    // Write a marker file so we can tell the dylib actually loaded, then show
-    // the floating badge (visible proof + tap-to-run).
     NSString *marker = [[reconFilePath() stringByDeletingLastPathComponent]
                         stringByAppendingPathComponent:@"_recon_loaded.txt"];
-    NSString *info = [NSString stringWithFormat:@"loaded @ %@\nbundle=%@\nhooked=%s\nversion=2\n",
-                      [NSDate date], [NSBundle mainBundle].bundleIdentifier, m ? "yes" : "no"];
+    NSString *info = [NSString stringWithFormat:@"loaded @ %@\nbundle=%@\nhooked=%s\nversion=%@\n",
+                      [NSDate date], [NSBundle mainBundle].bundleIdentifier,
+                      m ? "yes" : "no", RECON_VERSION];
     [info writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
@@ -633,9 +1090,7 @@ static void ArrowGameReconInit(void) {
         [[ReconOverlayController sharedInstance] showBadge];
     });
 
-    // Launch self-check ~8s after start. SILENT: it only writes the report and
-    // shows a short toast — it must NOT steal the screen while you are using
-    // the app or navigating into the mini-program.
+    // Silent launch self-check: writes the report and shows a short toast only.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         static BOOL ran = NO;
