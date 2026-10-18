@@ -54,6 +54,28 @@
 //     the two live signals that actually change during play.
 //   [CHORE] deepGameJS section D deduped by class.property and its cap raised
 //     48 -> 200.
+//
+// v8 changes (2026-10-16):
+//   v7's level dump settled the geometry (32x47 grid, 165 arrows = 651 rods,
+//   board fully tiled except 64 loose empty cells) but three different movement
+//   rules all failed to predict which arrows actually moved on a real tap. So
+//   v8 stops guessing and reads the game's own code:
+//   [NEW] funcJS()  -- `String(fn)` for checkPathPass / checkPathCanPass /
+//     getCanPassLine / classificationLine / getPointsInDirection* /
+//     getDirectionType / getXYIndexByIndex / checkLineType and friends. Pure
+//     toString(), nothing is invoked, so it cannot touch the board.
+//   [NEW] rodJS()   -- unwraps the physical model: arrowNodeList[i] is an ARRAY
+//     of rod nodes (v7 wrongly treated it as a single node, which is why the
+//     `active` column came out all zeros), plus the structure of one rod's
+//     components and of a grid-point cell.
+//   [NEW] callJS()  -- invokes ONLY read-only get/check helpers to ask the game
+//     which arrows it considers passable. arrowMove / hideArrowList /
+//     recoverPool / *Animation are never called.
+//   [BUGFIX] Heartbeat `off=` and levelJS's liveness column now test the rod
+//     ARRAY instead of the array object itself.
+//   [BUGFIX] The old `sig=` hashed arrowAllPointList, which turned out to be a
+//     STATIC level definition (constant across 14 successful moves). Replaced
+//     with `liveCells=<active grid points>/1504`, a genuinely live signal.
 // ============================================================================
 
 static UIWindow *gReconWindow = nil;
@@ -72,7 +94,7 @@ static dispatch_queue_t gSampleQueue = nil;
 static const NSInteger kMaxSamples = 180;
 static const double kSampleInterval = 1.0;
 
-#define RECON_VERSION @"7"
+#define RECON_VERSION @"8"
 
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
@@ -453,30 +475,41 @@ static NSString *deepGameJS(void) {
     @"return out.join('\\n')})()";
 }
 
-// v7: the level data is now CONFIRMED -- 32 x 47 grid, 165 polyline "arrows"
-// that completely tile the 1504 cells (gridPointList.length === 32*47).
-// So the heartbeat additionally tracks the two live signals we found:
-//   soundIndex  -- increments on every successful move
-//   arrowNodeList length / active count -- which arrows are still on the board
+// v8: two things we learned the hard way in v7 had to be fixed here.
+//   1. `arrowNodeList[i]` is NOT a node -- it is an ARRAY of rod nodes (one per
+//      straight segment; 165 arrows decompose into exactly 651 rods). Testing
+//      `node.active` on it therefore always failed and `off=` listed all 165.
+//      Now an arrow counts as alive if ANY of its rods is active.
+//   2. `arrowAllPointList` is a STATIC level definition -- its signature never
+//      changed across a whole session with 14 successful moves. So the old
+//      `sig=` was a constant. Replaced with liveCells: how many of the 1504
+//      grid-point nodes are currently active, which IS a live signal.
 static NSString *miniStateJS(void) {
     return @"(function(){var W=null;try{W=frames[0]}catch(e){}if(!W)return 'noFrame';"
            @"try{var cc=W.cc;if(!cc)return 'cc=<undef>';"
            @"if(!cc.director||!cc.director.getScene)return 'cc-no-director';"
            @"var sc=cc.director.getScene();if(!sc)return 'noScene';var n=0;"
            @"(function w2(x,d){if(!x||d>9)return;n++;var c=x.children||[];for(var i=0;i<c.length;i++)w2(c[i],d+1)})(sc,0);"
+           @"var cn=cc.js&&cc.js.getClassName;"
+           @"var as=W.__reconAS,gs=W.__reconGS;"
+           @"if(!as||as.isValid===false||!gs||gs.isValid===false){as=null;gs=null;"
+           @"(function w3(x,d){if((as&&gs)||!x||d>14)return;var a=[];try{a=x._components||x.components||[]}catch(e){}"
+           @"for(var i=0;i<a.length;i++){var nm=null;try{nm=cn?cn(a[i]):null}catch(e){}"
+           @"if(nm==='ArrowSystem'&&!as)as=a[i];else if(nm==='GridSystem'&&!gs)gs=a[i]}"
+           @"var ch=x.children||[];for(var j=0;j<ch.length;j++)w3(ch[j],d+1)})(sc,0);W.__reconAS=as;W.__reconGS=gs}"
            @"var ex='';"
-           @"try{var as=W.__reconAS;var cn=cc.js&&cc.js.getClassName;"
-           @"if(!as||as.isValid===false){as=null;"
-           @"(function w3(x,d){if(as||!x||d>14)return;var a=[];try{a=x._components||x.components||[]}catch(e){}"
-           @"for(var i=0;i<a.length;i++){var nm=null;try{nm=cn?cn(a[i]):null}catch(e){}if(nm==='ArrowSystem'){as=a[i];break}}"
-           @"var ch=x.children||[];for(var j=0;j<ch.length;j++)w3(ch[j],d+1)})(sc,0);W.__reconAS=as}"
-           @"if(as){var nl=as.arrowNodeList||[];var act=0,off=[];"
-           @"for(var i=0;i<nl.length;i++){try{var nd=nl[i];if(nd&&(nd.active===true||(nd.node&&nd.node.active===true)))act++;else off.push(i)}catch(e){}}"
-           @"var all=as.arrowAllPointList||[];var h1=0,h2=0;"
-           @"for(var q=0;q<all.length;q++){var cs=all[q]||[];h1=(h1+(q+1)*cs.length)%1000003;h2=(h2+((cs[0]||0)+1)*(q+7))%1000003}"
-           @"ex=' snd='+as.soundIndex+' arrows='+nl.length+' act='+act"
-           @"+' off='+(off.length?off.join(','):'-')"
-           @"+' sig='+all.length+'/'+h1+'/'+h2}}catch(e){ex=' stateErr'}"
+           @"try{if(as){var nl=as.arrowNodeList||[];var act=0,off=[];"
+           @"for(var i=0;i<nl.length;i++){var live=0;"
+           @"try{var r0=nl[i];"
+           @"if(r0&&typeof r0.length==='number'){for(var z=0;z<r0.length;z++){var nd=r0[z];"
+           @"if(nd&&(nd.active===true||(nd.node&&nd.node.active===true))){live=1;break}}}"
+           @"else if(r0&&r0.active===true){live=1}}catch(e){}"
+           @"if(live)act++;else off.push(i)}"
+           @"var os=off.length>70?('('+off.length+')'+off.slice(0,70).join(',')):(off.length?off.join(','):'-');"
+           @"ex+=' snd='+as.soundIndex+' arrows='+nl.length+' act='+act+' off='+os}}catch(e){ex+=' ASerr'}"
+           @"try{if(gs&&gs.gridPointList){var L=gs.gridPointList,lc=0;"
+           @"for(var i2=0;i2<L.length;i2++){try{if(L[i2]&&L[i2].active===true)lc++}catch(e){}}"
+           @"ex+=' liveCells='+lc+'/'+L.length}}catch(e){ex+=' GSerr'}"
            @"return 'scene='+sc.name+' nodes='+n+' vp='+W.innerWidth+'x'+W.innerHeight+ex}catch(e){return 'ERR '+e}})()";
 }
 
@@ -559,13 +592,16 @@ static NSString *levelJS(void) {
     @"var i0,i1,i2,nx;var uniq2=[];for(var q=0;q<gw*gh;q++){if(own[q]===undefined)uniq2.push(q)}"
     @"S('EMPTY_CELLS n='+uniq2.length+(uniq2.length?' first30='+uniq2.slice(0,30).join(','):''));"
     @"S('sample arrowPointList[0..4]='+J(apl?apl.slice(0,5):null,400));"
-    @"S('### ARROW NODES (index active nodeName)');"
-    @"for(var i=0;i<(anl?anl.length:0)&&i<400;i++){var nd=null,act=-1,nm='?',pos='';"
-    @"try{nd=anl[i];if(nd){nm=nd.name;act=(nd.active===true||(nd.node&&nd.node.active===true))?1:0;pos=J(nd.position,60)}}catch(e){nm='<err>'}S('N'+i+' '+act+' '+nm+' '+pos)}"
-    @"S('### ARROWS '+n+'  format=<idx> <active> <nCells> <firstCell> <lastCell> <cell,cell,...>');"
-    @"for(var i=0;i<n&&i<400;i++){var cs=aal[i]||[];var act=1;"
-    @"try{var nd2=anl?anl[i]:null;if(nd2&&!(nd2.active===true||(nd2.node&&nd2.node.active===true)))act=0}catch(e){}"
-    @"S(i+' '+act+' '+cs.length+' '+(cs[0]===undefined?'-':cs[0])+' '+(cs.length?cs[cs.length-1]:'-')+' '+cs.join(','))}"
+    @"S('### ARROW NODES (index live rodCount firstRodName)');"
+    @"for(var i=0;i<(anl?anl.length:0)&&i<400;i++){var live=0,rn=anl[i]||[],nm='?';"
+    @"try{if(rn.length){nm=rn[0].name||'?';for(var z=0;z<rn.length;z++){var nd=rn[z];"
+    @"if(nd&&(nd.active===true||(nd.node&&nd.node.active===true))){live=1;break}}}}catch(e){nm='<err>'}"
+    @"S('N'+i+' live='+live+' rods='+rn.length+' '+nm)}"
+    @"S('### ARROWS '+n+'  format=<idx> <live> <nCells> <firstCell> <lastCell> <cell,cell,...>');"
+    @"for(var i=0;i<n&&i<400;i++){var cs=aal[i]||[];var live=0,rn2=anl?anl[i]:null;"
+    @"try{if(rn2&&rn2.length){for(var z2=0;z2<rn2.length;z2++){var nd3=rn2[z2];"
+    @"if(nd3&&(nd3.active===true||(nd3.node&&nd3.node.active===true))){live=1;break}}}}catch(e){}"
+    @"S(i+' '+live+' '+cs.length+' '+(cs[0]===undefined?'-':cs[0])+' '+(cs.length?cs[cs.length-1]:'-')+' '+cs.join(','))}"
     @"return o.join('\\n')}"
     @"var s='';try{s=P(W)}catch(e){s='LEVEL_ERR '+e}"
     @"S(s);return out.join('\\n')})()";
@@ -623,6 +659,197 @@ static NSString *compJS(void) {
     @"}"
     @"return o.join('\\n')}"
     @"var s='';try{s=P(W)}catch(e){s='COMP_ERR '+e}"
+    @"S(s);return out.join('\\n')})()";
+}
+
+// v8 probe #1 -- THE decisive one. Instead of guessing the movement rule from
+// the geometry, print the game's own implementation. Cocos classes are plain
+// ES classes in the bundle, so `fn.toString()` hands back the real source.
+// This is completely side-effect free (no game method is called).
+static NSString *funcJS(void) {
+    return @"(function(){var out=[];"
+    @"function S(s){out.push(String(s))}"
+    @"var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W){return 'NO_IFRAME'}"
+    @"function P(W){"
+    @"var o=[];function S(s){o.push(String(s))}"
+    @"var cc=W.cc;if(!cc){S('NO_CC');return o.join('\\n')}"
+    @"function CN(c){try{if(cc.js&&cc.js.getClassName){var n=cc.js.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
+    @"var sc=null;try{sc=cc.director.getScene()}catch(e){}"
+    @"if(!sc){S('NO_SCENE');return o.join('\\n')}"
+    @"var gs=null,as=null;"
+    @"(function walk(nd,d){if(!nd||d>14)return;var a=[];try{a=nd._components||nd.components||[]}catch(e){}"
+    @"for(var i=0;i<a.length;i++){var nm=CN(a[i]);if(nm==='GridSystem'&&!gs)gs=a[i];else if(nm==='ArrowSystem'&&!as)as=a[i]}"
+    @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
+    @"function dump(obj,tag,names,cap){"
+    @"S('##### '+tag+' #####');"
+    @"if(!obj){S('  (component not found)');return}"
+    @"for(var i=0;i<names.length;i++){var n=names[i],f=null;"
+    @"try{f=obj[n]}catch(e){S('  -- '+n+' <read err>');continue}"
+    @"if(typeof f!=='function'){S('  -- '+n+' is '+typeof f);continue}"
+    @"var s='';try{s=String(f)}catch(e){s='<toString failed>';}"
+    @"S('===== '+tag+'.'+n+' ('+s.length+'B) =====');S(s.slice(0,cap))}}"
+    @"dump(as,'ArrowSystem',['checkPathPass','checkPathObsCount','checkLineSegmentIntersection',"
+    @"'getCanPassLine','classificationLine','getPointsInDirection','getPointsInDirectionByRowCol',"
+    @"'getDirectionType','getXYIndexByIndex','checkLineType','lineAutoPassByCount',"
+    @"'onCheckCanPassLineProp','arrowMove','arrowMoveRollback','getTargetPos','getAngle'],2600);"
+    @"dump(gs,'GridSystem',['worldToGrid','getPointsInDirection','getPointsInDirectionByRowCol',"
+    @"'getDirectionType','getXYIndexByIndex','getPointsBetween','getPointsBetweenByIndex',"
+    @"'checkLineType','getGridPosition','getGridPointByIndex'],2000);"
+    @"return o.join('\\n')}"
+    @"var s='';try{s=P(W)}catch(e){s='FUNC_ERR '+e}"
+    @"S(s);return out.join('\\n')})()";
+}
+
+// v8 probe #2 -- the physical model of one arrow. v7 taught us
+// arrowNodeList[i] is an ARRAY of rod nodes (its straight segments) and that
+// 165 arrows decompose into exactly 651 rods. So each rod must know its cells
+// and its direction. Walk one arrow and one grid cell down to primitives.
+static NSString *rodJS(void) {
+    return @"(function(){var out=[];"
+    @"function S(s){out.push(String(s))}"
+    @"var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W){return 'NO_IFRAME'}"
+    @"function P(W){"
+    @"var o=[];function S(s){o.push(String(s))}"
+    @"function J(v,mx){try{var s=JSON.stringify(v);if(s===undefined)s='[u]';if(mx&&s.length>mx)s=s.slice(0,mx)+'...';return s}catch(e){return '[circ]'}}"
+    @"function K(x){var a=[];try{for(var k in x)a.push(k)}catch(e){}return a}"
+    @"var cc=W.cc;if(!cc){S('NO_CC');return o.join('\\n')}"
+    @"function CN(c){try{if(cc.js&&cc.js.getClassName){var n=cc.js.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
+    @"var sc=null;try{sc=cc.director.getScene()}catch(e){}"
+    @"if(!sc){S('NO_SCENE');return o.join('\\n')}"
+    @"var gs=null,as=null;"
+    @"(function walk(nd,d){if(!nd||d>14)return;var a=[];try{a=nd._components||nd.components||[]}catch(e){}"
+    @"for(var i=0;i<a.length;i++){var nm=CN(a[i]);if(nm==='GridSystem'&&!gs)gs=a[i];else if(nm==='ArrowSystem'&&!as)as=a[i]}"
+    @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
+    @"function dmp(v,tag,dep){"
+    @"if(v===null||v===undefined){S(tag+' = '+String(v));return;}"
+    @"if(typeof v!=='object'){S(tag+' = '+J(v,140));return;}"
+    @"if(typeof v.length==='number'&&dep<3){"
+    @"S(tag+' = array['+v.length+']');"
+    @"for(var z=0;z<v.length&&z<3;z++){dmp(v[z],tag+'['+z+']',dep+1);}"
+    @"return;}"
+    @"S(tag+' = <'+CN(v)+'>');"
+    @"var ks=K(v);"
+    @"for(var z2=0;z2<ks.length;z2++){"
+    @"var k=ks[z2];"
+    @"if(k.charAt(0)==='_'&&k!=='_name'&&k!=='_active'&&k!=='_lpos'){continue;}"
+    @"var vv=null,ok=false;"
+    @"try{vv=v[k];ok=true;}catch(ee){ok=false;}"
+    @"if(!ok){continue;}"
+    @"var t=typeof vv;"
+    @"if(t==='function'){continue;}"
+    @"if(t==='object'&&vv!==null&&typeof vv.length==='number'){"
+    @"S('   '+tag+'.'+k+' array['+vv.length+']'+(vv.length&&typeof vv[0]!=='object'?' '+J(vv,200):''));"
+    @"}else if(t==='object'&&vv!==null){"
+    @"S('   '+tag+'.'+k+' object{'+K(vv).slice(0,16).join(',')+'}');"
+    @"}else{"
+    @"S('   '+tag+'.'+k+' = '+J(vv,110));"
+    @"}"
+    @"}"
+    @"}"
+    @"function dumpComp(obj,tag){"
+    @"if(!obj){S(tag+' = <null>');return;}"
+    @"var cs=[];"
+    @"try{cs=obj._components||obj.components||[];}catch(e){cs=[];}"
+    @"S(tag+' name='+(obj.name||'?')+' childCount='+(((obj.children||[]).length))+' comps='+cs.length);"
+    @"for(var i=0;i<cs.length;i++){"
+    @"var c=cs[i];"
+    @"S('  <'+CN(c)+'>');"
+    @"var ks2=K(c);"
+    @"for(var j=0;j<ks2.length;j++){"
+    @"var k2=ks2[j];"
+    @"if(k2.charAt(0)==='_'){continue;}"
+    @"var v2=null,ok2=false;"
+    @"try{v2=c[k2];ok2=true;}catch(e2){ok2=false;}"
+    @"if(!ok2){continue;}"
+    @"var t2=typeof v2;"
+    @"if(t2==='function'){continue;}"
+    @"if(t2==='object'&&v2!==null&&typeof v2.length==='number'){"
+    @"S('    .'+k2+' array['+v2.length+']'+(v2.length&&typeof v2[0]!=='object'?' '+J(v2,200):''));"
+    @"}else if(t2==='object'&&v2!==null){"
+    @"S('    .'+k2+' object{'+K(v2).slice(0,14).join(',')+'}');"
+    @"}else{"
+    @"S('    .'+k2+' = '+J(v2,110));"
+    @"}"
+    @"}"
+    @"}"
+    @"}"
+    @"S('##### ARROW 0 的三段结构 #####');"
+    @"try{var ap=as.arrowPointList[0],aa=as.arrowAllPointList[0],an=as.arrowNodeList[0];"
+    @"S('arrowPointList[0] len='+(ap?ap.length:-1)+' = '+J(ap,300));"
+    @"S('arrowAllPointList[0] len='+(aa?aa.length:-1)+' = '+J(aa,300));"
+    @"S('arrowNodeList[0] 杆数 = '+(an?an.length:-1))}catch(e){S('head err '+e)}"
+    @"for(var q=0;q<3;q++){try{dmp(as.arrowNodeList[q],'arrowNodeList['+q+']',0)}catch(e){S('erl '+e)}}"
+    @"S('##### 一根杆的内部结构（展开到组件属性）#####');"
+    @"try{var rods=as.arrowNodeList[0];if(rods&&rods.length){dumpComp(rods[0],'rod0')}else{S('arrow0 has no rod')}}catch(e){S('rod err '+e)}"
+    @"S('##### 网格单元节点的结构 #####');"
+    @"try{var gpl=gs.gridPointList;S('gridPointList len='+gpl.length);"
+    @"dmp(gpl[0],'gridPointList[0]',0);"
+    @"dmp(gpl[1],'gridPointList[1]',0);"
+    @"dmp(gpl[100],'gridPointList[100]',0)}catch(e){S('gpl err '+e)}"
+    @"S('##### ArrowSystem 的几个数值字段 #####');"
+    @"try{S('lineOffeset='+as.lineOffeset+' timer='+as.timer+' iswin='+as.iswin+' isUseVit='+as.isUseVit+' soundIndex='+as.soundIndex)}catch(e){}"
+    @"try{S('arrowColorList='+J(as.arrowColorList,300)+' arrowSpecialList='+J(as.arrowSpecialList,300))}catch(e){}"
+    @"try{S('alreadyReduceHpLineList='+J(as.alreadyReduceHpLineList,300))}catch(e){}"
+    @"try{S('DragBg minScale='+as.dragBg.minScale+' maxScale='+as.dragBg.maxScale+' enableScale='+as.dragBg.enableScale)}catch(e){}"
+    @"return o.join('\\n')}"
+    @"var s='';try{s=P(W)}catch(e){s='ROD_ERR '+e}"
+    @"S(s);return out.join('\\n')})()";
+}
+
+// v8 probe #3 -- ask the game directly which arrows are currently passable.
+// Only "get"/"check"-named helpers are invoked here; nothing that mutates the
+// board (arrowMove, hideArrowList, recoverPool, *Animation are never called).
+static NSString *callJS(void) {
+    return @"(function(){var out=[];"
+    @"function S(s){out.push(String(s))}"
+    @"var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W){return 'NO_IFRAME'}"
+    @"function P(W){"
+    @"var o=[];function S(s){o.push(String(s))}"
+    @"function J(v,mx){try{var s=JSON.stringify(v);if(s===undefined)s='[u]';if(mx&&s.length>mx)s=s.slice(0,mx)+'...';return s}catch(e){return '[circ]'}}"
+    @"var cc=W.cc;if(!cc){S('NO_CC');return o.join('\\n')}"
+    @"function CN(c){try{if(cc.js&&cc.js.getClassName){var n=cc.js.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
+    @"var sc=null;try{sc=cc.director.getScene()}catch(e){}"
+    @"if(!sc){S('NO_SCENE');return o.join('\\n')}"
+    @"var gs=null,as=null;"
+    @"(function walk(nd,d){if(!nd||d>14)return;var a=[];try{a=nd._components||nd.components||[]}catch(e){}"
+    @"for(var i=0;i<a.length;i++){var nm=CN(a[i]);if(nm==='GridSystem'&&!gs)gs=a[i];else if(nm==='ArrowSystem'&&!as)as=a[i]}"
+    @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
+    @"function TR(tag,fn){try{var r=fn();S(tag+' -> '+(typeof r)+' '+J(r,500))}catch(e){S(tag+' THREW: '+e)}}"
+    @"S('##### 纯查询：方向枚举 / 索引换算 #####');"
+    @"TR('as.getDirectionType(0)',function(){return as.getDirectionType(0)});"
+    @"TR('as.getDirectionType(1)',function(){return as.getDirectionType(1)});"
+    @"TR('as.getDirectionType(2)',function(){return as.getDirectionType(2)});"
+    @"TR('as.getDirectionType(3)',function(){return as.getDirectionType(3)});"
+    @"TR('as.getXYIndexByIndex(0)',function(){return as.getXYIndexByIndex(0)});"
+    @"TR('as.getXYIndexByIndex(1)',function(){return as.getXYIndexByIndex(1)});"
+    @"TR('as.getXYIndexByIndex(32)',function(){return as.getXYIndexByIndex(32)});"
+    @"TR('gs.getXYIndexByIndex(0)',function(){return gs.getXYIndexByIndex(0)});"
+    @"TR('gs.getXYIndexByIndex(1184)',function(){return gs.getXYIndexByIndex(1184)});"
+    @"TR('gs.getGridPosition(0)',function(){return gs.getGridPosition(0)});"
+    @"TR('gs.getPointsInDirection(0,0)',function(){return gs.getPointsInDirection(0,0)});"
+    @"TR('gs.getPointsInDirection(0,1)',function(){return gs.getPointsInDirection(0,1)});"
+    @"TR('gs.getPointsInDirection(0,2)',function(){return gs.getPointsInDirection(0,2)});"
+    @"TR('gs.getPointsInDirection(0,3)',function(){return gs.getPointsInDirection(0,3)});"
+    @"TR('gs.getPointsBetween(0,100)',function(){return gs.getPointsBetween(0,100)});"
+    @"TR('gs.checkLineType([0,1,2])',function(){return gs.checkLineType([0,1,2])});"
+    @"TR('as.checkLineType([0,1,2])',function(){return as.checkLineType([0,1,2])});"
+    @"S('##### 关键：当前可以通行的线 #####');"
+    @"TR('as.checkPathObsCount(0)',function(){return as.checkPathObsCount(0)});"
+    @"TR('as.checkPathPass(0)',function(){return as.checkPathPass(0)});"
+    @"TR('as.getCanPassLine()',function(){return as.getCanPassLine()});"
+    @"S('##### 可能改状态的，放最后 #####');"
+    @"TR('as.classificationLine()',function(){return as.classificationLine()});"
+    @"return o.join('\\n')}"
+    @"var s='';try{s=P(W)}catch(e){s='CALL_ERR '+e}"
     @"S(s);return out.join('\\n')})()";
 }
 
@@ -692,6 +919,9 @@ static NSString *probeAllWebViews(void) {
             [r appendFormat:@"DEEP:\n%@\n", evalJS(w, deepGameJS(), 5.0)];
             [r appendFormat:@"LEVEL:\n%@\n", evalJS(w, levelJS(), 6.0)];
             [r appendFormat:@"COMPONENTS:\n%@\n", evalJS(w, compJS(), 6.0)];
+            [r appendFormat:@"FUNCSRC (游戏的判定函数源码):\n%@\n", evalJS(w, funcJS(), 8.0)];
+            [r appendFormat:@"ROD (杆/单元结构):\n%@\n", evalJS(w, rodJS(), 8.0)];
+            [r appendFormat:@"CALLS (只读查询):\n%@\n", evalJS(w, callJS(), 8.0)];
         }
     }
     return r;
