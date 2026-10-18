@@ -98,6 +98,27 @@
 //     v8 invoked it and perturbed the board. Removed for good.
 //   [NEW] funcJS also dumps onArrowTouchStart (the move handler -- tells us how
 //     far one tap moves an arrow), hideArrowList, checkGameWin, update.
+//
+// v10 changes (2026-10-16):  *** the helper actually works now ***
+//   v9's ground truth came back and the rule matched 165/165 (per-arrow
+//   checkPathPass verdict, zero mismatches; the passable set was byte-identical
+//   [0,1,2,3,4,5,6,7,9,10,11,12,14,19,20,25,26,27,30,46,52]). onArrowTouchStart's
+//   source also confirmed the move semantics: a correct tap runs the tail width
+//   through the head rod and then does `t.forEach(t => t.active = false)`, i.e.
+//   the whole arrow leaves the board; a wrong tap plays "error", resets
+//   soundIndex to 0 and costs one heart (ReduceHp, at most once per line).
+//   So the solver now runs on our side:
+//   [NEW] solveJS() -- greedy solve from (static cell lists + live rod active
+//     flags). Removal only frees cells, so the passable set is monotonically
+//     non-decreasing and greedy converges order-independently. Verified on the
+//     real board: 165/165 cleared, no stall.
+//   [NEW] Marker overlay (level 9999, fully click-through) that paints the next
+//     8 steps as numbered circles at each arrow's head cell. Screen coordinates
+//     are computed from the LIVE Grid node transform (worldPosition/worldScale)
+//     so panning and zooming keep working.
+//   [NEW] "求解 · 标出下一步" button.
+//   [NOTE] soundIndex is a success STREAK counter: ++ on a correct tap, reset to
+//     0 on a wrong one. So an increment does mean "that tap worked".
 // ============================================================================
 
 static UIWindow *gReconWindow = nil;
@@ -116,7 +137,7 @@ static dispatch_queue_t gSampleQueue = nil;
 static const NSInteger kMaxSamples = 180;
 static const double kSampleInterval = 1.0;
 
-#define RECON_VERSION @"9"
+#define RECON_VERSION @"10"
 
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
@@ -133,6 +154,7 @@ static const double kSampleInterval = 1.0;
 - (void)updateBadgeLook;
 - (void)btnToggleSampling;
 - (void)btnDeepProbe;
+- (void)btnSolve;
 - (void)togglePanel;
 @end
 
@@ -906,6 +928,164 @@ static NSString *callJS(void) {
     @"S(s);return out.join('\\n')})()";
 }
 
+#pragma mark - v10: the actual solver
+
+// The rule was verified 165/165 against the game's own checkPathPass verdicts,
+// so the solver can now run entirely on OUR side -- it needs only two things
+// from the game: the static arrow cell lists, and which arrows are still alive.
+//
+//   alive   = arrowNodeList[i] has at least one active rod node
+//             (on a successful tap the game does `t.forEach(t => t.active=false)`)
+//   occ     = union of the cells of all alive arrows
+//   pass(i) = the corridor from cells[0] in direction (cells[0]-cells[1]) is empty
+//
+// Removal only ever FREES cells, so the set of passable arrows grows
+// monotonically and greedy converges to an order-independent fixed point.
+// If greedy clears everything, the level is solved; if it stalls, so would the
+// player. Verified on the real board: 165/165, zero stalls.
+//
+// Screen conversion comes from the LIVE Grid node transform, so it keeps
+// working when the player pans or zooms the board (DragBg allows both):
+//   world = gridNode.worldPosition + gridPositions[row][col] * gridNode.worldScale
+//   pt    = (world.x * K, (visibleSize.height - world.y) * K)      K = frameW / visW
+static NSString *solveJS(void) {
+    return @"(function(){var out=[];"
+    @"function S(s){out.push(String(s))}"
+    @"var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W){return 'NO_IFRAME'}"
+    @"function P(W){"
+    @"var o=[];function S(s){o.push(String(s))}"
+    @"var cc=W.cc;if(!cc){S('NO_CC');return o.join('\\n')}"
+    @"function CN(c){try{if(cc.js&&cc.js.getClassName){var n=cc.js.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
+    @"var sc=null;try{sc=cc.director.getScene()}catch(e){}"
+    @"if(!sc){S('NO_SCENE');return o.join('\\n')}"
+    @"var gs=null,as=null;"
+    @"(function walk(nd,d){if(!nd||d>14)return;var a=[];try{a=nd._components||nd.components||[]}catch(e){}"
+    @"for(var i=0;i<a.length;i++){var nm=CN(a[i]);if(nm==='GridSystem'&&!gs)gs=a[i];else if(nm==='ArrowSystem'&&!as)as=a[i]}"
+    @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
+    @"if(!gs||!as){S('ERR_NO_COMPONENT');return o.join('\\n')}"
+    @"var GW=gs.gridWidth,GH=gs.gridHeight;"
+    @"var A=as.arrowAllPointList||[],N=as.arrowNodeList||[];"
+    @"var vs=null,fs=null;try{vs=cc.view.getVisibleSize();fs=cc.view.getFrameSize()}catch(e){}"
+    @"if(!vs||!fs){S('ERR_NO_VIEW');return o.join('\\n')}"
+    @"var K=fs.width/vs.width;"
+    @"var gn=gs.node,gwp=gn.getWorldPosition(),gsc=gn.getWorldScale();"
+    @"var GP=gs.gridPositions;"
+    @"function scr(cell){var r=Math.floor(cell/GW),c=cell%GW;var p=GP[r][c];"
+    @"var wx=gwp.x+p.x*gsc.x,wy=gwp.y+p.y*gsc.y;"
+    @"return [wx*K,(vs.height-wy)*K]}"
+    @"var aliveSet={},aliveN=0;"
+    @"for(var i=0;i<A.length;i++){var rods=N[i],on=0;"
+    @"if(rods&&rods.length){for(var z=0;z<rods.length;z++){var nd=rods[z];"
+    @"if(nd&&(nd.active===true||(nd.node&&nd.node.active===true))){on=1;break}}}"
+    @"if(on){aliveSet[i]=1;aliveN++}}"
+    @"var occ={};for(var i in aliveSet){var cs=A[i]||[];for(var j=0;j<cs.length;j++)occ[cs[j]]=1}"
+    @"function dirOf(cs){var r0=Math.floor(cs[0]/GW),c0=cs[0]%GW;var r1=Math.floor(cs[1]/GW),c1=cs[1]%GW;return [r0-r1,c0-c1]}"
+    @"function corridor(head,d){var r=Math.floor(head/GW),c=head%GW;var o2=[];"
+    @"r+=d[0];c+=d[1];"
+    @"while(r>=0&&r<GH&&c>=0&&c<GW){o2.push(r*GW+c);r+=d[0];c+=d[1]}"
+    @"return o2}"
+    @"function canPass(i){var cs=A[i];if(!cs||cs.length<2)return false;"
+    @"var cor=corridor(cs[0],dirOf(cs));"
+    @"for(var j=0;j<cor.length;j++){if(occ[cor[j]])return false}"
+    @"return true}"
+    @"var order=[];var guard=0;"
+    @"while(guard++<1000){var f=-1;"
+    @"for(var q=0;q<A.length;q++){if(!aliveSet[q])continue;if(canPass(q)){f=q;break}}"
+    @"if(f<0)break;"
+    @"var cs=A[f]||[];for(var j=0;j<cs.length;j++){delete occ[cs[j]]}"
+    @"delete aliveSet[f];order.push(f)}"
+    @"var remain=0,remainList=[];"
+    @"for(var q=0;q<A.length;q++){if(aliveSet[q]){remain++;if(remainList.length<20)remainList.push(q)}}"
+    @"S('### PLAN alive='+aliveN+' solvable='+order.length+' remain='+remain+' total='+A.length+' K='+K.toFixed(5));"
+    @"var DC={'-1,0':'D','1,0':'U','0,-1':'L','0,1':'R'};"
+    @"S('### STEPS <step> <arrowIdx> <xPt> <yPt> <dir> <nCells>');"
+    @"for(var s=0;s<order.length&&s<220;s++){var i2=order[s];var cs2=A[i2]||[];"
+    @"var d=dirOf(cs2);var sp=scr(cs2[0]);"
+    @"S((s+1)+' '+i2+' '+sp[0].toFixed(1)+' '+sp[1].toFixed(1)+' '+(DC[d[0]+','+d[1]]||'?')+' '+cs2.length)}"
+    @"if(remain>0)S('### STUCK n='+remain+' first='+remainList.join(','));"
+    @"return o.join('\\n')}"
+    @"var s2='';try{s2=P(W)}catch(e){s2='SOLVE_ERR '+e}"
+    @"S(s2);return out.join('\\n')})()";
+}
+
+// ---- marker layer -------------------------------------------------------
+// Sits UNDER the recon panel (level 9999 vs 10000) and is fully click-through:
+// the marker labels have userInteractionEnabled = NO, and ReconWindow turns a
+// hitTest that lands on the bare root view into nil, so the game keeps
+// receiving every touch.
+static UIWindow *gSolverWindow = nil;
+
+static void clearSolverMarkers(void) {
+    if (!gSolverWindow) return;
+    UIView *root = gSolverWindow.rootViewController.view;
+    for (UIView *v in [root.subviews copy]) {
+        if (v.tag == 7001 || v.tag == 7002) [v removeFromSuperview];
+    }
+}
+
+static void hideSolverMarkers(void) {
+    runOnMainSync(^{
+        clearSolverMarkers();
+        if (gSolverWindow) gSolverWindow.hidden = YES;
+    });
+}
+
+static void showSolverPlan(NSArray<NSDictionary *> *steps, NSString *hud) {
+    runOnMainSync(^{
+        if (!gSolverWindow) {
+            gSolverWindow = makeOverlayWindow();
+            gSolverWindow.windowLevel = 9999;
+            gSolverWindow.backgroundColor = [UIColor clearColor];
+            UIViewController *r = [[UIViewController alloc] init];
+            r.view = [[PassthroughView alloc] initWithFrame:gSolverWindow.bounds];
+            r.view.backgroundColor = [UIColor clearColor];
+            r.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            gSolverWindow.rootViewController = r;
+        }
+        clearSolverMarkers();
+        UIView *root = gSolverWindow.rootViewController.view;
+
+        UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(8, 8, root.bounds.size.width - 16, 26)];
+        h.tag = 7001;
+        h.text = hud;
+        h.textAlignment = NSTextAlignmentCenter;
+        h.font = [UIFont boldSystemFontOfSize:12];
+        h.textColor = [UIColor whiteColor];
+        h.backgroundColor = [UIColor colorWithRed:0.10 green:0.42 blue:0.20 alpha:0.90];
+        h.layer.cornerRadius = 8;
+        h.layer.masksToBounds = YES;
+        h.userInteractionEnabled = NO;
+        [root addSubview:h];
+
+        NSUInteger n = steps.count;
+        for (NSUInteger k = 0; k < n; k++) {
+            NSDictionary *st = steps[k];
+            CGFloat x = [st[@"x"] doubleValue];
+            CGFloat y = [st[@"y"] doubleValue];
+            BOOL first = (k == 0);
+            CGFloat d = first ? 42.0 : 30.0;
+            UILabel *m = [[UILabel alloc] initWithFrame:CGRectMake(x - d / 2.0, y - d / 2.0, d, d)];
+            m.tag = 7002;
+            m.text = [NSString stringWithFormat:@"%lu", (unsigned long)(k + 1)];
+            m.textAlignment = NSTextAlignmentCenter;
+            m.font = [UIFont boldSystemFontOfSize:(first ? 19 : 14)];
+            m.textColor = [UIColor whiteColor];
+            m.backgroundColor = first ? [UIColor colorWithRed:0.88 green:0.15 blue:0.15 alpha:0.94]
+                                      : [UIColor colorWithRed:0.10 green:0.45 blue:0.85 alpha:0.82];
+            m.layer.cornerRadius = d / 2.0;
+            m.layer.masksToBounds = YES;
+            m.layer.borderWidth = first ? 3.0 : 2.0;
+            m.layer.borderColor = [UIColor whiteColor].CGColor;
+            m.userInteractionEnabled = NO;
+            [root addSubview:m];
+        }
+        gSolverWindow.hidden = NO;
+    });
+}
+
 // Higher score = more likely to be the game's JS host.
 static NSInteger scoreWebView(WKWebView *w) {
     NSString *url = [[w.URL absoluteString] lowercaseString] ?: @"";
@@ -1362,7 +1542,19 @@ static void runRecon(BOOL showPanel) {
         [card addSubview:gSampleBtn];
         [self updateSampleButton];
 
-        CGFloat ty = row3 + bh + 8.0;
+        // Row 4: the solver itself (full width)
+        CGFloat row4 = row3 + bh + gap;
+        UIButton *solveBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        solveBtn.frame = CGRectMake(pad, row4, cardW - pad * 2, bh);
+        [solveBtn setTitle:@"求解 · 标出下一步" forState:UIControlStateNormal];
+        [solveBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        solveBtn.backgroundColor = [UIColor colorWithRed:0.10 green:0.50 blue:0.30 alpha:1.0];
+        solveBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        solveBtn.layer.cornerRadius = 7;
+        [solveBtn addTarget:self action:@selector(btnSolve) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:solveBtn];
+
+        CGFloat ty = row4 + bh + 8.0;
         gReconTextView = [[UITextView alloc] initWithFrame:CGRectMake(pad, ty, cardW - pad * 2, cardH - ty - pad)];
         gReconTextView.editable = NO;
         gReconTextView.font = [UIFont fontWithName:@"Menlo" size:9];
@@ -1473,6 +1665,62 @@ static void runRecon(BOOL showPanel) {
                 [self presentActivityWithItems:@[[NSURL fileURLWithPath:path]]];
             } else {
                 [self showToast:@"深度探测写入失败"];
+            }
+        });
+    });
+}
+
+// v10: compute the solution and draw it straight onto the board.
+// Reads the static layout + which arrows are alive, runs the greedy solve in
+// JS, then places numbered markers at each arrow's head cell. The first marker
+// is big and red; the next seven are smaller and blue. Do them in order, then
+// press the button again for the next batch (or after a zoom/pan, so the
+// markers get recomputed against the new transform).
+- (void)btnSolve {
+    [self showToast:@"正在计算…"];
+    hideSolverMarkers();          // 清掉上一次的标注，避免和新结果叠在一起
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger best = -1;
+        NSArray<WKWebView *> *wes = webViewsWithInfo(NULL, &best);
+        NSString *txt = nil;
+        if (wes.count && best >= 0 && (NSUInteger)best < wes.count) {
+            txt = evalJS(wes[best], solveJS(), 12.0);
+        }
+        NSMutableArray<NSDictionary *> *steps = [NSMutableArray array];
+        NSString *plan = nil;
+        if (txt.length) {
+            for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+                if ([line hasPrefix:@"### PLAN"]) { plan = line; continue; }
+                if (!line.length) continue;
+                unichar c0 = [line characterAtIndex:0];
+                if (!(c0 >= '0' && c0 <= '9')) continue;
+                NSArray *f = [line componentsSeparatedByString:@" "];
+                if (f.count < 6) continue;
+                [steps addObject:@{ @"i": f[1],
+                                    @"x": @([f[2] doubleValue]),
+                                    @"y": @([f[3] doubleValue]),
+                                    @"d": f[4],
+                                    @"n": f[5] }];
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (steps.count) {
+                NSUInteger show = MIN((NSUInteger)8, steps.count);
+                NSArray *head = [steps subarrayWithRange:NSMakeRange(0, show)];
+                NSMutableString *hud = [NSMutableString string];
+                if (plan.length) {
+                    [hud appendString:[plan stringByReplacingOccurrencesOfString:@"### PLAN " withString:@""]];
+                } else {
+                    [hud appendFormat:@"共 %lu 步", (unsigned long)steps.count];
+                }
+                showSolverPlan(head, hud);
+                [self hide];
+                [self showToast:@"已标注：按号码顺序点，再按一次看下一批"];
+            } else if (txt.length) {
+                NSString *msg = txt.length > 120 ? [txt substringToIndex:120] : txt;
+                [self showToast:msg];
+            } else {
+                [self showToast:@"求解失败：先进到关卡里再点"];
             }
         });
     });
