@@ -178,7 +178,7 @@ git push -u origin main
 
 ---
 
-## 深度探针（v8，首要用法）
+## 深度探针（v9，首要用法）
 
 引擎已经确认是 **Cocos Creator 3.8.4**，游戏跑在 `PLDWebView` 里一个**同源 iframe** (`game-iframe.html`) 中，
 `cc` / `my` / `MYGameGlobal` 都挂在那个 iframe 的 window 上。所以**游戏状态可以直接读**：
@@ -190,11 +190,12 @@ git push -u origin main
 文件里有十二段：游戏帧的全局变量与已加载 JS、Cocos 版本与设计分辨率、**完整场景树**、数据型组件属性（去重后）、
 Cocos 注册类名与 bundle、`MYGameGlobal` 结构、localStorage、
 **`LEVEL:` 机器可读的关卡数据**（网格变换 + 165 条箭头的完整格子序列 + 空格清单 + 就地自校验）、
-**`COMPONENTS:` 按类名去重后的全属性 dump**，
-以及 v8 新增的三段 ——
-**`FUNCSRC:` 游戏自己的判定函数源码**（26 个方法的 `toString()`，纯读不调用）、
-**`ROD:` 一根杆/一个网格单元的内部结构**、
-**`CALLS:` 只读查询**（`getCanPassLine` / `checkPathPass` 等，直接问游戏哪些线能通行）。
+**`COMPONENTS:` 按类名去重后的全属性 dump**、
+**`FUNCSRC:` 游戏自己的判定函数源码**（27 个方法的 `toString()`，纯读不调用）、
+**`ROD:` 一根杆/一个网格单元的内部结构**，
+以及 v9 重写的 **`CALLS:`** —— 五部分：逐条 `eulerAngles.z` + 头格、
+**`checkPathPass` 对全部 165 条箭头的判决（标准答案）**、
+**完整 `gridPointLineIDInfo` 实时占用表**、方向枚举自检、运行数值。
 
 ---
 
@@ -275,6 +276,28 @@ Cocos 注册类名与 bundle、`MYGameGlobal` 结构、localStorage、
 >   ⚠ `DragBg` 有 `enableScale=true / minScale=0.677 / maxScale=2.45 / enableInertia` —— **盘面可拖动缩放**，叠加方案必须每帧读 `Grid` 的实时变换，不能写死。
 > - **修正箭头端后**，判据「箭头前方一格为空」推出初始 **54/165 条可动**，而用户**第一次点击**的 A22 正好在其中（头 (3,28) 朝右、前方 (3,29) 为空）→ 自洽。
 > - **踩坑记录**：v8 的 `rodJS` 首次提交时括号不平衡（`else{...}}` 多一个 `}`），被静态校验器第 6 项（真跑 JS）当场抓出 `Unexpected token 'catch'`，重写为结构清晰的分支后通过。
+>
+> **v9（2026-10-16）** v8 的 `FUNCSRC` 一次成功 —— **规则不再是猜的，是游戏源码原文**：
+>
+> ```js
+> // checkPathPass(arrowList)
+> 方向 = rod[0].eulerAngles.z : 0→左  90→下  180→右  -90→上
+> 头格 = arrowPointList[lineID][0]
+> 走廊 = gridSystem.getPointsInDirection(头格, 方向)   // 头格之外直到边界
+> 通行 ⇔ 走廊上一个占用格子都没有  ⇔ return -1
+> 占用表 = gridSystem.gridPointLineIDInfo (cell → lineID)
+> ```
+>
+> - **几何二次闭环**：`rod.startWidth = 跨度格数 × cellWidth + lineOffeset`。A0 的 124.5 = 4×30+4.5、A1 的 34.5 = 1×30+4.5、A2 的 64.5 = 2×30+4.5，逐个精确吻合。
+> - **头格位置双路印证**：源码里的 `arrowPointList[lineID][0]` 与上一轮纯靠截图墨量测出的 `cells[0]` 完全一致。
+> - **求解器已跑通**：按该规则实现贪心，本关 **165/165 全部清空、无卡死**。因为移除箭头只会释放格子，可通行集合单调不减 —— 规则若错必然中途卡死，所以这是一次强验证。初始可通行 **21 条**，与此前独立算出的「走廊全空 = 21」一致。
+> - **[BUGFIX]** v8 的 `checkPathPass(0)` 传的是**索引**，而函数签名要**杆数组**（内部 `t[0].eulerAngles`、`arrowNodeList.indexOf(t)`）→ 165 次调用全抛异常。
+> - **[BUGFIX]** v8 把 `getCanPassLine()` 整体 `JSON.stringify`，其返回值里 `arrowList` 是 cc.Node 数组 → 循环引用，只剩 `[circ]`，`lineID` 丢失。v9 只取 `.lineID`。
+> - **[BUGFIX 安全性]** **`classificationLine()` 不是只读的**：它会对最长的三条线调用 `onArrowTouchStart`，**真的会移动箭头**。v8 调用了它并扰动了盘面，v9 起永久不再调用。
+> - **[CHORE]** 删掉 `getDirectionType` / `getXYIndexByIndex` / `checkLineType` 在 ArrowSystem 上的调用（这些方法只在 GridSystem 上存在）；`getPointsInDirection` 改为传真正的 Vec3（传数字会报 `i.clone is not a function`）。
+> - **[NEW]** `CALLS` 段五部分：逐条 `eulerAngles.z` + 头格、**`checkPathPass` 对全部 165 条的判决**、**完整 `gridPointLineIDInfo` 实时占用表**、方向枚举自检、运行数值。
+> - **[NEW]** `FUNCSRC` 追加 `onArrowTouchStart`（一次点击滑多远，模拟的最后一块拼图）、`hideArrowList`、`checkGameWin`、`update`。
+> - **纠正**：`soundIndex` **不是**"移动成功"的标志。按真规则 A22 初始并不可通行，而它第一次被点时 `snd` 照样涨 —— 之前用 `snd` 增量判断成功/失败的做法作废，唯一标准答案是 `checkPathPass`。
 
 **报告文件路径**（跟随运行环境自动选择）：
 
