@@ -178,7 +178,7 @@ git push -u origin main
 
 ---
 
-## 深度探针（v7，首要用法）
+## 深度探针（v8，首要用法）
 
 引擎已经确认是 **Cocos Creator 3.8.4**，游戏跑在 `PLDWebView` 里一个**同源 iframe** (`game-iframe.html`) 中，
 `cc` / `my` / `MYGameGlobal` 都挂在那个 iframe 的 window 上。所以**游戏状态可以直接读**：
@@ -187,10 +187,14 @@ git push -u origin main
 2. **越早按越好** —— 点 RG 小球 → 面板出现 → 点蓝色的 **「深度探针」**
 3. 等 1~2 秒 → 自动弹分享面板 → 导出 `arrowgame_deep.txt`
 
-文件里有九段：游戏帧的全局变量与已加载 JS、Cocos 版本与设计分辨率、**完整场景树**、数据型组件属性（去重后）、
-Cocos 注册类名与 bundle、`MYGameGlobal` 结构、localStorage，
-外加 v7 新增的两段 —— **`LEVEL:` 机器可读的关卡数据**（网格变换 + 165 条箭头的完整格子序列 + 每条 active + 空格清单 + 自校验）
-与 **`COMPONENTS:` 按类名去重后的全属性 dump**。
+文件里有十二段：游戏帧的全局变量与已加载 JS、Cocos 版本与设计分辨率、**完整场景树**、数据型组件属性（去重后）、
+Cocos 注册类名与 bundle、`MYGameGlobal` 结构、localStorage、
+**`LEVEL:` 机器可读的关卡数据**（网格变换 + 165 条箭头的完整格子序列 + 空格清单 + 就地自校验）、
+**`COMPONENTS:` 按类名去重后的全属性 dump**，
+以及 v8 新增的三段 ——
+**`FUNCSRC:` 游戏自己的判定函数源码**（26 个方法的 `toString()`，纯读不调用）、
+**`ROD:` 一根杆/一个网格单元的内部结构**、
+**`CALLS:` 只读查询**（`getCanPassLine` / `checkPathPass` 等，直接问游戏哪些线能通行）。
 
 ---
 
@@ -258,6 +262,19 @@ Cocos 注册类名与 bundle、`MYGameGlobal` 结构、localStorage，
 > - **[CHORE]** `deepGameJS` 的 D 段按 `class.property` 去重，额度 48 → 200。
 > - **[CHORE]** v7 实测确认的关卡参数：Cocos Creator **3.8.4**、fitWidth（设计 750×1334 → 逻辑 750×1629.55）、棋盘 **32×47 = 1504 格**、格距 30 设计单位 = 12.0pt、**165 条折线箭头**。格子→屏幕映射 `screen = (220,478) + design×(0.4,-0.4)`，与截图实测误差 < 2pt。
 > - **踩坑记录**：v7 一度把公共 JS helper 写成 `#define` 宏复用，被离线静态校验器立刻抓出 `K is not defined` —— 宏在预处理阶段展开，校验器读的是原始 ObjC 源码，于是 helper 对它不可见，**校验形同失效**。改为显式内联。这类"能编译但让工具失效"的写法不值得为省几行而用。
+>
+> **v8（2026-10-16）** v7 的关卡导出把几何彻底钉死（32×47、165 条箭头 = 651 根杆、`row*32+col` 索引、`overlaps=0`），但三种通行判据**全部无法解释真实的点击成功/失败**。复盘发现根因不在规则而在模型：
+>
+> - **[BUGFIX 关键]** **箭头端搞反了**。v7 假定箭头在 `cells[-1]`，实际在 **`cells[0]`**，方向 = `cells[0] − cells[1]`。这是**量出来的**：对全部箭头逐格统计截图深色像素，`cells[0]` 平均 224.8（比邻居 +38.6），`cells[-1]` 平均 136.0（比邻居 −45.0，那是线头收尾）；84 条可测箭头里 **70 条首端有墨量尖峰、0 条末端有**。用修正后的朝向重新标注，红色标记与游戏画的箭头**完全重合**。
+> - **[BUGFIX]** `arrowNodeList[i]` **不是节点，是"杆"数组**（箭头 0 有 5 根杆 ↔ 其 6 个转折点）。v7 拿它当节点测 `.active`，所以心跳里 `act=`/`off=` 全错（`off` 恒为全部 165 条）。
+> - **[BUGFIX]** 旧 `sig=` 哈希的是 `arrowAllPointList`，而它是**静态关卡定义** —— 65 个样本、14 次成功移动期间**纹丝不动**。换成 `liveCells=<仍被占用的格数>/1504`。
+> - **[NEW] `funcJS()`** —— 用 `String(fn)` 导出游戏自己的判定实现：`checkPathPass` / `checkPathObsCount` / `checkLineSegmentIntersection` / `getCanPassLine` / `classificationLine` / `getPointsInDirection*` / `getDirectionType` / `getXYIndexByIndex` / `checkLineType` / `lineAutoPassByCount` / `onCheckCanPassLineProp` / `arrowMove` / `arrowMoveRollback` / `getTargetPos` / `getAngle`，外加 GridSystem 的 `worldToGrid` 等，共 26 个。**纯 toString，一个方法都不调用，零副作用。**
+> - **[NEW] `rodJS()`** —— 展开物理模型：`arrowNodeList[i]` 的杆结构（节点名 `gan`）、一根杆的全部组件属性、`gridPointList[i]` 单元结构。
+> - **[NEW] `callJS()`** —— **只调用 get/check 类只读方法**，直接问游戏"现在哪些线能通行"。`arrowMove` / `hideArrowList` / `recoverPool` / `*Animation` **绝不调用**；`classificationLine()` 排在最后，万一它真会改状态，前面的数据也已经落盘。
+> - **坐标映射锁定**：`Grid` 节点 `worldPos={375,814.7727}`、`worldScale=0.6770842999`，`viewScale=1.76`（=440×3/750） → `screen = (220,478) + design×(0.39722, −0.39722)`，推算棋盘外框与截图实测**误差 < 2pt**。
+>   ⚠ `DragBg` 有 `enableScale=true / minScale=0.677 / maxScale=2.45 / enableInertia` —— **盘面可拖动缩放**，叠加方案必须每帧读 `Grid` 的实时变换，不能写死。
+> - **修正箭头端后**，判据「箭头前方一格为空」推出初始 **54/165 条可动**，而用户**第一次点击**的 A22 正好在其中（头 (3,28) 朝右、前方 (3,29) 为空）→ 自洽。
+> - **踩坑记录**：v8 的 `rodJS` 首次提交时括号不平衡（`else{...}}` 多一个 `}`），被静态校验器第 6 项（真跑 JS）当场抓出 `Unexpected token 'catch'`，重写为结构清晰的分支后通过。
 
 **报告文件路径**（跟随运行环境自动选择）：
 
