@@ -297,7 +297,45 @@ Cocos 注册类名与 bundle、`MYGameGlobal` 结构、localStorage、
 > - **[CHORE]** 删掉 `getDirectionType` / `getXYIndexByIndex` / `checkLineType` 在 ArrowSystem 上的调用（这些方法只在 GridSystem 上存在）；`getPointsInDirection` 改为传真正的 Vec3（传数字会报 `i.clone is not a function`）。
 > - **[NEW]** `CALLS` 段五部分：逐条 `eulerAngles.z` + 头格、**`checkPathPass` 对全部 165 条的判决**、**完整 `gridPointLineIDInfo` 实时占用表**、方向枚举自检、运行数值。
 > - **[NEW]** `FUNCSRC` 追加 `onArrowTouchStart`（一次点击滑多远，模拟的最后一块拼图）、`hideArrowList`、`checkGameWin`、`update`。
-> - **纠正**：`soundIndex` **不是**"移动成功"的标志。按真规则 A22 初始并不可通行，而它第一次被点时 `snd` 照样涨 —— 之前用 `snd` 增量判断成功/失败的做法作废，唯一标准答案是 `checkPathPass`。
+> - **纠正**：v9 时按真规则 A22 初始不可通行，而它被点时 `snd` 照样涨，于是误判"`soundIndex` 不是成功标志"。**v10 读到 `onArrowTouchStart` 源码后结论反转**：成功时 `soundIndex++`、失败时播 error 音并把 `soundIndex` 重置为 0（还扣一颗心），所以它涨确实代表那一下点对了。唯一标准答案仍是 `checkPathPass`，但 `snd` 的语义这下清楚了。
+> - **[NEW v10]** `solveJS()` 贪心求解器 + 可穿透的编号标记层 + 「求解 · 标出下一步」按钮（详见下面「求解器」一节）。
+
+## 求解器（v10，现在的主角）
+
+v9 的标准答案回来了，规则与实现**逐条对得上**：
+
+```
+逐条判决（checkPathPass vs 我的实现）   一致 165 / 165，不一致 0
+可通行集合                              完全相同
+方向（eulerAngles.z vs cells[0]-cells[1]） 165 / 165 一致
+头格（arrowPointList[0] vs arrowAllPointList[0]） 165 / 165 一致
+```
+
+游戏给出的初始可通行集合 `0,1,2,3,4,5,6,7,9,10,11,12,14,19,20,25,26,27,30,46,52`（21 条），我算的一模一样。
+
+`onArrowTouchStart` 的源码也确认了动作语义：**点对了整条箭头滑出棋盘**（末尾 `t.forEach(t => t.active = false)`），
+**点错了播 error 音、`soundIndex` 归 0、扣一颗心**（`ReduceHp`，同一条线只扣一次）。
+顺带纠正：`soundIndex` 是**成功连击数**（成功 +1、失败归 0），所以它涨确实代表那一下点对了。
+
+### 算法
+
+`alive` = `arrowNodeList[i]` 里还有 active 的杆；`occ` = 所有 alive 箭头占的格子并集；
+`pass(i)` = 从 `cells[0]` 沿 `cells[0]-cells[1]` 方向到边界的走廊全空。
+**移除只释放格子** → 可通行集合单调不减 → 贪心一遍到底且与顺序无关。本关实测 **165/165 清空、零卡死**。
+
+### 用法
+
+进关卡 → 点 RG 小球 → 点绿色 **「求解 · 标出下一步」** → 盘面上出现编号圆圈，按 1、2、3… 点。
+大红色圈是第一个，后面 7 个是蓝色。一批点完再按一次。
+
+屏幕坐标来自 **Grid 节点的实时 `worldPosition`/`worldScale`**：
+```
+world = gridNode.worldPosition + gridPositions[row][col] * gridNode.worldScale
+pt    = (world.x * K, (visibleSize.height - world.y) * K)        K = frameSize.width / visibleSize.width
+```
+所以拖动/缩放后重按一次就能重新对齐（`DragBg` 允许 `minScale=0.677 ~ maxScale=2.45` 并可惯性拖动）。
+标记层在 `windowLevel 9999`（低于面板的 10000），标签 `userInteractionEnabled = NO`，
+配合 `ReconWindow` 的 `hitTest` 返回 `nil`，**完全不挡触摸**。
 
 **报告文件路径**（跟随运行环境自动选择）：
 
