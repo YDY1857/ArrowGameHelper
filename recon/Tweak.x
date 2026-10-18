@@ -76,6 +76,28 @@
 //   [BUGFIX] The old `sig=` hashed arrowAllPointList, which turned out to be a
 //     STATIC level definition (constant across 14 successful moves). Replaced
 //     with `liveCells=<active grid points>/1504`, a genuinely live signal.
+//
+// v9 changes (2026-10-16):
+//   v8's FUNCSRC worked -- the game's rule is now known verbatim:
+//     dir      = rod[0].eulerAngles.z : 0->left, 90->down, 180->right, -90->up
+//     head     = arrowPointList[lineID][0]
+//     corridor = gridSystem.getPointsInDirection(head, dir)   // head+1 .. edge
+//     passable <=> corridor contains no occupied cell  <=>  checkPathPass()==-1
+//     occupancy map = gridSystem.gridPointLineIDInfo (cell -> lineID)
+//   So v9 just asks for the verdicts and the live map instead of inferring them:
+//   [NEW] callJS section A: per-arrow eulerAngles.z + head cell + rod count.
+//   [NEW] callJS section B: checkPathPass(nl[i]) for ALL 165 arrows -- the
+//     game's own pass/fail verdict, plus getCanPassLine().lineID.
+//   [NEW] callJS section C: the whole gridPointLineIDInfo occupancy map.
+//   [NEW] callJS section D: direction-enum sanity with real Vec3 arguments.
+//   [BUGFIX] v8's callJS passed an INDEX to checkPathPass (which wants the rod
+//     array) -- every call threw. It also stringify'd getCanPassLine()'s return
+//     value, whose arrowList holds cc.Nodes, so all we got was [circ].
+//   [BUGFIX] ** classificationLine() is NOT read-only ** -- it calls
+//     onArrowTouchStart on the three longest lines, which actually MOVES arrows.
+//     v8 invoked it and perturbed the board. Removed for good.
+//   [NEW] funcJS also dumps onArrowTouchStart (the move handler -- tells us how
+//     far one tap moves an arrow), hideArrowList, checkGameWin, update.
 // ============================================================================
 
 static UIWindow *gReconWindow = nil;
@@ -94,7 +116,7 @@ static dispatch_queue_t gSampleQueue = nil;
 static const NSInteger kMaxSamples = 180;
 static const double kSampleInterval = 1.0;
 
-#define RECON_VERSION @"8"
+#define RECON_VERSION @"9"
 
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
@@ -691,10 +713,11 @@ static NSString *funcJS(void) {
     @"if(typeof f!=='function'){S('  -- '+n+' is '+typeof f);continue}"
     @"var s='';try{s=String(f)}catch(e){s='<toString failed>';}"
     @"S('===== '+tag+'.'+n+' ('+s.length+'B) =====');S(s.slice(0,cap))}}"
-    @"dump(as,'ArrowSystem',['checkPathPass','checkPathObsCount','checkLineSegmentIntersection',"
-    @"'getCanPassLine','classificationLine','getPointsInDirection','getPointsInDirectionByRowCol',"
-    @"'getDirectionType','getXYIndexByIndex','checkLineType','lineAutoPassByCount',"
-    @"'onCheckCanPassLineProp','arrowMove','arrowMoveRollback','getTargetPos','getAngle'],2600);"
+    @"dump(as,'ArrowSystem',['onArrowTouchStart','arrowMove','arrowMoveRollback',"
+    @"'checkPathPass','checkPathObsCount','checkLineSegmentIntersection',"
+    @"'getCanPassLine','classificationLine','lineAutoPassByCount',"
+    @"'onCheckCanPassLineProp','hideArrowList','getTargetPos','getAngle',"
+    @"'checkGameWin','oneCheckGameWin','getProgressStr','update'],3000);"
     @"dump(gs,'GridSystem',['worldToGrid','getPointsInDirection','getPointsInDirectionByRowCol',"
     @"'getDirectionType','getXYIndexByIndex','getPointsBetween','getPointsBetweenByIndex',"
     @"'checkLineType','getGridPosition','getGridPointByIndex'],2000);"
@@ -802,9 +825,31 @@ static NSString *rodJS(void) {
     @"S(s);return out.join('\\n')})()";
 }
 
-// v8 probe #3 -- ask the game directly which arrows are currently passable.
-// Only "get"/"check"-named helpers are invoked here; nothing that mutates the
-// board (arrowMove, hideArrowList, recoverPool, *Animation are never called).
+// v9 probe: THE ground truth. v8's FUNCSRC section handed us the game's own
+// rule verbatim, so v8's callJS was both mis-targeted and subtly harmful:
+//   - checkPathPass(0) / checkPathObsCount(0) were passed an INDEX, but the
+//     function signature is checkPathPass(arrowList) -- it does `t[0].eulerAngles`
+//     and `arrowNodeList.indexOf(t)`. Hence "undefined is not an object".
+//   - getCanPassLine() returns {lineID, arrowList} where arrowList is an array
+//     of cc.Nodes -> JSON.stringify hits a cycle, so all we saw was [circ].
+//     The useful field is .lineID alone.
+//   - getDirectionType / getXYIndexByIndex / checkLineType do NOT exist on
+//     ArrowSystem (only on GridSystem) -- three wasted lines.
+//   - getPointsInDirection(index, dirVec) needs a Vec3 with .clone(); passing 0
+//     threw "i.clone is not a function".
+//   - ** classificationLine() is NOT read-only **: it calls onArrowTouchStart on
+//     the three longest lines, i.e. it actually MOVES arrows. v8 called it and
+//     perturbed the board. It is never called again.
+//
+// The decoded rule (from FUNCSRC):
+//   direction = from rod[0].eulerAngles.z:  0 -> (-1,0) left, 90 -> (0,-1) down,
+//                                         180 -> (1,0) right, -90 -> (0,1) up
+//   head cell = arrowPointList[lineID][0]
+//   corridor  = gridSystem.getPointsInDirection(head, dir)  // head+1 .. edge
+//   passable  <=> no cell in the corridor has a gridPointLineIDInfo entry
+//                 (checkPathPass returns -1)
+// So this probe asks the game for that verdict directly, plus the live
+// occupancy map, plus each arrow's real direction angle.
 static NSString *callJS(void) {
     return @"(function(){var out=[];"
     @"function S(s){out.push(String(s))}"
@@ -814,7 +859,6 @@ static NSString *callJS(void) {
     @"if(!W){return 'NO_IFRAME'}"
     @"function P(W){"
     @"var o=[];function S(s){o.push(String(s))}"
-    @"function J(v,mx){try{var s=JSON.stringify(v);if(s===undefined)s='[u]';if(mx&&s.length>mx)s=s.slice(0,mx)+'...';return s}catch(e){return '[circ]'}}"
     @"var cc=W.cc;if(!cc){S('NO_CC');return o.join('\\n')}"
     @"function CN(c){try{if(cc.js&&cc.js.getClassName){var n=cc.js.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
     @"var sc=null;try{sc=cc.director.getScene()}catch(e){}"
@@ -823,31 +867,40 @@ static NSString *callJS(void) {
     @"(function walk(nd,d){if(!nd||d>14)return;var a=[];try{a=nd._components||nd.components||[]}catch(e){}"
     @"for(var i=0;i<a.length;i++){var nm=CN(a[i]);if(nm==='GridSystem'&&!gs)gs=a[i];else if(nm==='ArrowSystem'&&!as)as=a[i]}"
     @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
-    @"function TR(tag,fn){try{var r=fn();S(tag+' -> '+(typeof r)+' '+J(r,500))}catch(e){S(tag+' THREW: '+e)}}"
-    @"S('##### 纯查询：方向枚举 / 索引换算 #####');"
-    @"TR('as.getDirectionType(0)',function(){return as.getDirectionType(0)});"
-    @"TR('as.getDirectionType(1)',function(){return as.getDirectionType(1)});"
-    @"TR('as.getDirectionType(2)',function(){return as.getDirectionType(2)});"
-    @"TR('as.getDirectionType(3)',function(){return as.getDirectionType(3)});"
-    @"TR('as.getXYIndexByIndex(0)',function(){return as.getXYIndexByIndex(0)});"
-    @"TR('as.getXYIndexByIndex(1)',function(){return as.getXYIndexByIndex(1)});"
-    @"TR('as.getXYIndexByIndex(32)',function(){return as.getXYIndexByIndex(32)});"
-    @"TR('gs.getXYIndexByIndex(0)',function(){return gs.getXYIndexByIndex(0)});"
-    @"TR('gs.getXYIndexByIndex(1184)',function(){return gs.getXYIndexByIndex(1184)});"
-    @"TR('gs.getGridPosition(0)',function(){return gs.getGridPosition(0)});"
-    @"TR('gs.getPointsInDirection(0,0)',function(){return gs.getPointsInDirection(0,0)});"
-    @"TR('gs.getPointsInDirection(0,1)',function(){return gs.getPointsInDirection(0,1)});"
-    @"TR('gs.getPointsInDirection(0,2)',function(){return gs.getPointsInDirection(0,2)});"
-    @"TR('gs.getPointsInDirection(0,3)',function(){return gs.getPointsInDirection(0,3)});"
-    @"TR('gs.getPointsBetween(0,100)',function(){return gs.getPointsBetween(0,100)});"
-    @"TR('gs.checkLineType([0,1,2])',function(){return gs.checkLineType([0,1,2])});"
-    @"TR('as.checkLineType([0,1,2])',function(){return as.checkLineType([0,1,2])});"
-    @"S('##### 关键：当前可以通行的线 #####');"
-    @"TR('as.checkPathObsCount(0)',function(){return as.checkPathObsCount(0)});"
-    @"TR('as.checkPathPass(0)',function(){return as.checkPathPass(0)});"
-    @"TR('as.getCanPassLine()',function(){return as.getCanPassLine()});"
-    @"S('##### 可能改状态的，放最后 #####');"
-    @"TR('as.classificationLine()',function(){return as.classificationLine()});"
+    @"if(!as){S('NO_ArrowSystem');return o.join('\\n')}"
+    @"var nl=as.arrowNodeList||[];"
+    @"S('### A. DIRECTION AND HEAD  format: <i> z=<eulerAngles.z> head=<cell> rods=<n> pts=<n>');"
+    @"for(var i=0;i<nl.length;i++){"
+    @"var z='?',hd='?',nr=0,np=0;"
+    @"try{var rods=nl[i];nr=rods?rods.length:0;if(rods&&rods.length){var r0=rods[0];z=r0.eulerAngles?r0.eulerAngles.z:'na'}}catch(e){z='err'}"
+    @"try{var ap=as.arrowPointList[i];np=ap?ap.length:0;hd=ap?ap[0]:'?'}catch(e){hd='err'}"
+    @"S(i+' z='+z+' head='+hd+' rods='+nr+' pts='+np)}"
+    @"S('### B. PASS (game verdict)  format: <i> <blockerCell|-1=canPass>');"
+    @"var cp=[];var npass=0;"
+    @"for(var i=0;i<nl.length;i++){"
+    @"var r='?';"
+    @"try{r=as.checkPathPass(nl[i])}catch(e){r='ERR'}"
+    @"S(i+' '+r);"
+    @"if(r===-1){npass++;cp.push(i)}}"
+    @"S('CANPASS_COUNT='+npass);"
+    @"S('CANPASS_LIST='+cp.join(','));"
+    @"try{var g=as.getCanPassLine();S('getCanPassLine.lineID='+(g?g.lineID:'null'))}catch(e){S('getCanPassLine ERR '+e)}"
+    @"S('### C. OCCUPANCY gridPointLineIDInfo  (live cell -> lineID)');"
+    @"try{var m=as.gridSystem.gridPointLineIDInfo;"
+    @"S('hasSize='+(m&&typeof m.size==='number')+' size='+(m?m.size:'?'));"
+    @"if(m&&typeof m.forEach==='function'){var ent=[];m.forEach(function(v,k){ent.push(k+':'+v)});"
+    @"S('entries='+ent.length);S(ent.join(' '))}"
+    @"else{S('keys='+((m&&Object.keys(m).length)||0));S(JSON.stringify(m).slice(0,20000))}}catch(e){S('occ ERR '+e)}"
+    @"S('### D. direction enum sanity (Vec3 args, read-only)');"
+    @"function V3(x,y,z){try{if(cc.v3)return cc.v3(x,y,z);if(cc.Vec3)return new cc.Vec3(x,y,z)}catch(e){}return null}"
+    @"try{var dirs=[V3(1,0,0),V3(-1,0,0),V3(0,1,0),V3(0,-1,0)];var tags=['+x','-x','+y','-y'];"
+    @"for(var i=0;i<dirs.length;i++){if(!dirs[i]){S('  V3 unavailable');break}"
+    @"var t1='?';try{t1=gs.getDirectionType(dirs[i])}catch(e){t1='ERR '+e}"
+    @"S('  getDirectionType('+tags[i]+')='+t1)}}catch(e){S('  enum ERR '+e)}"
+    @"try{S('  head0 corridor='+JSON.stringify(gs.getPointsInDirection(as.arrowPointList[0][0],V3(1,0,0)).slice(0,6)))}catch(e){S('  corridor ERR '+e)}"
+    @"S('### E. 其它在跑的数值');"
+    @"try{S('soundIndex='+as.soundIndex+' timer='+as.timer+' iswin='+as.iswin+' isUseVit='+as.isUseVit+' lineOffeset='+as.lineOffeset)}catch(e){}"
+    @"try{S('alreadyReduceHpLineList='+JSON.stringify(as.alreadyReduceHpLineList))}catch(e){}"
     @"return o.join('\\n')}"
     @"var s='';try{s=P(W)}catch(e){s='CALL_ERR '+e}"
     @"S(s);return out.join('\\n')})()";
