@@ -119,6 +119,26 @@
 //   [NEW] "求解 · 标出下一步" button.
 //   [NOTE] soundIndex is a success STREAK counter: ++ on a correct tap, reset to
 //     0 on a wrong one. So an increment does mean "that tap worked".
+//
+// v11 changes (2026-10-19):  *** hands-free ***
+//   v10's markers were confirmed landing in the right place, so the last step is
+//   to actually do the tapping. We do NOT synthesise UITouch objects (private
+//   ivars, version-fragile) -- we call the game's own tap handler instead:
+//       as.onArrowTouchStart(as.arrowNodeList[i], i, false)
+//   which is the exact function a finger ends up in, so all of the game's own
+//   bookkeeping (hideShowArrowTouch / clearLinePos / checkGameWin / soundIndex)
+//   runs normally and its state can never drift.
+//   [NEW] startAutoJS() -- a self-driving setTimeout chain INSIDE the page:
+//     solve -> re-verify with the game's OWN checkPathPass -> call the handler ->
+//     wait until that arrow's rods go inactive -> next. ObjC only polls a short
+//     status string every 500 ms, so no 165 round-trips.
+//   [SAFETY] Before every single auto move we assert checkPathPass()===-1; the
+//     run aborts immediately if the game disagrees with our solver, so an auto
+//     move can never cost a heart.
+//   [NEW] "自动通关（全自动）" toggle + "清除标注" button + a progress strip.
+//   [NOTE] evalJS waits on a semaphore that only a MAIN-queue completion handler
+//     signals -- so it deadlocks if called on the main thread. autoTick does its
+//     web-view work on a background queue and hops to main only to paint.
 // ============================================================================
 
 static UIWindow *gReconWindow = nil;
@@ -137,7 +157,7 @@ static dispatch_queue_t gSampleQueue = nil;
 static const NSInteger kMaxSamples = 180;
 static const double kSampleInterval = 1.0;
 
-#define RECON_VERSION @"10"
+#define RECON_VERSION @"11"
 
 @interface ReconOverlayController : NSObject
 + (instancetype)sharedInstance;
@@ -155,6 +175,10 @@ static const double kSampleInterval = 1.0;
 - (void)btnToggleSampling;
 - (void)btnDeepProbe;
 - (void)btnSolve;
+- (void)btnAuto;
+- (void)autoTick;
+- (void)updateAutoButton;
+- (void)btnClearMarks;
 - (void)togglePanel;
 @end
 
@@ -1018,6 +1042,57 @@ static NSString *solveJS(void) {
 // receiving every touch.
 static UIWindow *gSolverWindow = nil;
 
+// Call on the main thread only.
+static UIView *ensureSolverWindow(void) {
+    if (!gSolverWindow) {
+        gSolverWindow = makeOverlayWindow();
+        gSolverWindow.windowLevel = 9999;
+        gSolverWindow.backgroundColor = [UIColor clearColor];
+        UIViewController *r = [[UIViewController alloc] init];
+        r.view = [[PassthroughView alloc] initWithFrame:gSolverWindow.bounds];
+        r.view.backgroundColor = [UIColor clearColor];
+        r.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        gSolverWindow.rootViewController = r;
+    }
+    gSolverWindow.hidden = NO;
+    return gSolverWindow.rootViewController.view;
+}
+
+// Progress strip for auto-play (tag 7003). Kept separate from the step markers
+// (7001/7002) so polling every 500 ms does not wipe them.
+static void updateAutoHud(NSString *text) {
+    runOnMainSync(^{
+        UIView *root = ensureSolverWindow();
+        UILabel *l = nil;
+        for (UIView *v in root.subviews) {
+            if (v.tag == 7003 && [v isKindOfClass:[UILabel class]]) { l = (UILabel *)v; break; }
+        }
+        if (!l) {
+            l = [[UILabel alloc] initWithFrame:CGRectMake(8, 40, root.bounds.size.width - 16, 24)];
+            l.tag = 7003;
+            l.textAlignment = NSTextAlignmentCenter;
+            l.font = [UIFont boldSystemFontOfSize:12];
+            l.textColor = [UIColor whiteColor];
+            l.layer.cornerRadius = 7;
+            l.layer.masksToBounds = YES;
+            l.userInteractionEnabled = NO;
+            [root addSubview:l];
+        }
+        l.backgroundColor = [UIColor colorWithRed:0.80 green:0.42 blue:0.05 alpha:0.92];
+        l.text = text;
+    });
+}
+
+static void hideAutoHud(void) {
+    runOnMainSync(^{
+        if (!gSolverWindow) return;
+        UIView *root = gSolverWindow.rootViewController.view;
+        for (UIView *v in [root.subviews copy]) {
+            if (v.tag == 7003) [v removeFromSuperview];
+        }
+    });
+}
+
 static void clearSolverMarkers(void) {
     if (!gSolverWindow) return;
     UIView *root = gSolverWindow.rootViewController.view;
@@ -1035,18 +1110,8 @@ static void hideSolverMarkers(void) {
 
 static void showSolverPlan(NSArray<NSDictionary *> *steps, NSString *hud) {
     runOnMainSync(^{
-        if (!gSolverWindow) {
-            gSolverWindow = makeOverlayWindow();
-            gSolverWindow.windowLevel = 9999;
-            gSolverWindow.backgroundColor = [UIColor clearColor];
-            UIViewController *r = [[UIViewController alloc] init];
-            r.view = [[PassthroughView alloc] initWithFrame:gSolverWindow.bounds];
-            r.view.backgroundColor = [UIColor clearColor];
-            r.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            gSolverWindow.rootViewController = r;
-        }
+        UIView *root = ensureSolverWindow();
         clearSolverMarkers();
-        UIView *root = gSolverWindow.rootViewController.view;
 
         UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(8, 8, root.bounds.size.width - 16, 26)];
         h.tag = 7001;
@@ -1084,6 +1149,96 @@ static void showSolverPlan(NSArray<NSDictionary *> *steps, NSString *hud) {
         }
         gSolverWindow.hidden = NO;
     });
+}
+
+#pragma mark - v11: auto-play
+
+// Instead of synthesising UITouch objects (private ivars, version-fragile), we
+// call the game's OWN tap handler from its JS realm:
+//
+//     as.onArrowTouchStart(as.arrowNodeList[i], i, false)
+//
+// That is literally the function a finger ends up in, so it does all the normal
+// bookkeeping itself: hideShowArrowTouch, checkPathPass, clearLinePos,
+// checkGameWin, soundIndex. The game can never end up in an inconsistent state.
+//
+// Safety: right before every call we re-verify with the game's OWN
+// checkPathPass() and abort the whole run if it disagrees with our solver -- so
+// an auto move can never cost a heart.
+//
+// The loop lives inside the page (setTimeout chain) so ObjC only polls a tiny
+// status string once every 500 ms instead of driving 165 round-trips.
+static NSString *startAutoJS(void) {
+    return @"(function(){var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W)return 'NO_IFRAME';"
+    @"try{if(W.__reconAuto)W.__reconAuto.running=0}catch(e){}"
+    @"var cc=W.cc;if(!cc)return 'NO_CC';"
+    @"function CN(c){try{if(cc.js&&cc.js.getClassName){var n=cc.js.getClassName(c);if(n)return n}}catch(e){}try{return (c&&c.constructor&&c.constructor.name)||'?'}catch(e){return '?'}}"
+    @"var sc=null;try{sc=cc.director.getScene()}catch(e){}"
+    @"if(!sc)return 'NO_SCENE';"
+    @"var gs=null,as=null;"
+    @"(function walk(nd,d){if(!nd||d>14)return;var a=[];try{a=nd._components||nd.components||[]}catch(e){}"
+    @"for(var i=0;i<a.length;i++){var nm=CN(a[i]);if(nm==='GridSystem'&&!gs)gs=a[i];else if(nm==='ArrowSystem'&&!as)as=a[i]}"
+    @"var ch=nd.children||[];for(var j=0;j<ch.length;j++)walk(ch[j],d+1)})(sc,0);"
+    @"if(!gs||!as)return 'NO_COMPONENT';"
+    @"var GW=gs.gridWidth,GH=gs.gridHeight,A=as.arrowAllPointList||[],N=as.arrowNodeList||[];"
+    @"if(!A.length)return 'NO_ARROWS';"
+    @"var st={running:1,step:0,alive:0,lastIdx:-1,msg:'start',delay:140};W.__reconAuto=st;"
+    @"function live(i){var r=null;try{r=N[i]}catch(e){return 0}"
+    @"if(!r||!r.length)return 0;"
+    @"for(var z=0;z<r.length;z++){var nd=r[z];if(nd&&(nd.active===true||(nd.node&&nd.node.active===true)))return 1}"
+    @"return 0}"
+    @"function dirOf(cs){var r0=Math.floor(cs[0]/GW),c0=cs[0]%GW;var r1=Math.floor(cs[1]/GW),c1=cs[1]%GW;return [r0-r1,c0-c1]}"
+    @"function ok(i,occ){var cs=A[i];if(!cs||cs.length<2)return false;"
+    @"var d=dirOf(cs);var r=Math.floor(cs[0]/GW),c=cs[0]%GW;"
+    @"r+=d[0];c+=d[1];"
+    @"while(r>=0&&r<GH&&c>=0&&c<GW){if(occ[r*GW+c])return false;r+=d[0];c+=d[1]}"
+    @"return true}"
+    @"var loop=function(){"
+    @"if(!st.running){st.msg='stopped';return;}"
+    @"if(st.step>420){st.running=0;st.msg='stepcap';return;}"
+    @"var al=[],occ={};"
+    @"for(var i=0;i<A.length;i++){if(!live(i))continue;al.push(i);var cs=A[i];for(var j=0;j<cs.length;j++)occ[cs[j]]=1;}"
+    @"st.alive=al.length;"
+    @"if(!al.length){st.running=0;st.msg='cleared';return;}"
+    @"var pick=-1;"
+    @"for(var q=0;q<al.length;q++){if(ok(al[q],occ)){pick=al[q];break;}}"
+    @"if(pick<0){st.running=0;st.msg='stuck alive='+al.length;return;}"
+    @"var vd=-99;try{vd=as.checkPathPass(N[pick]);}catch(e){vd=-98;}"
+    @"if(vd!==-1){st.running=0;st.msg='verifyfail i='+pick+' v='+vd;return;}"
+    @"try{as.onArrowTouchStart(N[pick],pick,false);}catch(e){st.running=0;st.msg='callerr '+e;return;}"
+    @"st.step++;st.lastIdx=pick;st.msg='moved '+pick;"
+    @"var wt=0;"
+    @"var chk=function(){"
+    @"if(!st.running)return;"
+    @"wt+=140;"
+    @"if(!live(pick)&&wt>=280){W.setTimeout(loop,140);return;}"
+    @"if(wt>3200){W.setTimeout(loop,140);return;}"
+    @"W.setTimeout(chk,140);};"
+    @"W.setTimeout(chk,160);};"
+    @"W.setTimeout(loop,350);"
+    @"return 'AUTO_START total='+A.length;})()";
+}
+
+static NSString *autoStatusJS(void) {
+    return @"(function(){var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W)return 'NO_IFRAME';"
+    @"var s=null;try{s=W.__reconAuto}catch(e){}"
+    @"if(!s)return 'no-auto';"
+    @"return 'run='+s.running+' step='+s.step+' alive='+s.alive+' last='+s.lastIdx+' msg='+s.msg;})()";
+}
+
+static NSString *stopAutoJS(void) {
+    return @"(function(){var W=null;"
+    @"try{for(var i=0;i<window.length;i++){try{var w=frames[i];var h=String(w.location.href);if(h.indexOf('iframe')>=0){W=w;break}}catch(e){}}}catch(e){}"
+    @"if(!W){try{W=frames[0]}catch(e){}}"
+    @"if(!W)return 'NO_IFRAME';"
+    @"try{if(W.__reconAuto){W.__reconAuto.running=0;return 'STOPPED step='+W.__reconAuto.step;}}catch(e){}"
+    @"return 'NO_AUTO';})()";
 }
 
 // Higher score = more likely to be the game's JS host.
@@ -1554,7 +1709,28 @@ static void runRecon(BOOL showPanel) {
         [solveBtn addTarget:self action:@selector(btnSolve) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:solveBtn];
 
-        CGFloat ty = row4 + bh + 8.0;
+        // Row 5: auto-play toggle + clear markers
+        CGFloat row5 = row4 + bh + gap;
+        gAutoBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        gAutoBtn.frame = CGRectMake(pad, row5, bw, bh);
+        [gAutoBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        gAutoBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        gAutoBtn.layer.cornerRadius = 7;
+        [gAutoBtn addTarget:self action:@selector(btnAuto) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:gAutoBtn];
+        [self updateAutoButton];
+
+        UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        clearBtn.frame = CGRectMake(pad + bw + gap, row5, bw, bh);
+        [clearBtn setTitle:@"清除标注" forState:UIControlStateNormal];
+        [clearBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        clearBtn.backgroundColor = [UIColor colorWithRed:0.26 green:0.28 blue:0.34 alpha:1.0];
+        clearBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        clearBtn.layer.cornerRadius = 7;
+        [clearBtn addTarget:self action:@selector(btnClearMarks) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:clearBtn];
+
+        CGFloat ty = row5 + bh + 8.0;
         gReconTextView = [[UITextView alloc] initWithFrame:CGRectMake(pad, ty, cardW - pad * 2, cardH - ty - pad)];
         gReconTextView.editable = NO;
         gReconTextView.font = [UIFont fontWithName:@"Menlo" size:9];
@@ -1724,6 +1900,122 @@ static void runRecon(BOOL showPanel) {
             }
         });
     });
+}
+
+// ---- auto-play driver ---------------------------------------------------
+static BOOL gAutoOn = NO;
+static dispatch_source_t gAutoTimer = nil;
+static UIButton *gAutoBtn = nil;
+
+- (void)updateAutoButton {
+    if (!gAutoBtn) return;
+    if (gAutoOn) {
+        [gAutoBtn setTitle:@"停止自动" forState:UIControlStateNormal];
+        gAutoBtn.backgroundColor = [UIColor colorWithRed:0.72 green:0.16 blue:0.16 alpha:1.0];
+    } else {
+        [gAutoBtn setTitle:@"自动通关（全自动）" forState:UIControlStateNormal];
+        gAutoBtn.backgroundColor = [UIColor colorWithRed:0.62 green:0.36 blue:0.05 alpha:1.0];
+    }
+}
+
+- (void)startAutoPoll {
+    if (gAutoTimer) return;
+    gAutoTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(gAutoTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                              (uint64_t)(0.5 * NSEC_PER_SEC), 0);
+    __weak __typeof(self) wk = self;
+    dispatch_source_set_event_handler(gAutoTimer, ^{ [wk autoTick]; });
+    dispatch_resume(gAutoTimer);
+}
+
+- (void)stopAutoPoll {
+    if (!gAutoTimer) return;
+    dispatch_source_cancel(gAutoTimer);
+    gAutoTimer = nil;
+}
+
+// NOTE: evalJS blocks on a semaphore that a main-queue completion handler has to
+// signal -- so it must never run ON the main thread or it deadlocks instantly.
+// autoTick therefore does its web-view work on a background queue and only hops
+// back to main to paint the HUD.
+- (void)autoTick {
+    if (!gAutoOn) { [self stopAutoPoll]; return; }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger best = -1;
+        NSArray<WKWebView *> *wes = webViewsWithInfo(NULL, &best);
+        if (!wes.count || best < 0 || (NSUInteger)best >= wes.count) return;
+        NSString *st = evalJS(wes[best], autoStatusJS(), 1.5);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!gAutoOn) return;
+            updateAutoHud([NSString stringWithFormat:@"自动：%@", st]);
+            if ([st rangeOfString:@"run=0"].location != NSNotFound ||
+                [st isEqualToString:@"no-auto"] ||
+                [st hasPrefix:@"NO_"]) {
+                gAutoOn = NO;
+                [self stopAutoPoll];
+                [self updateAutoButton];
+                if ([st rangeOfString:@"cleared"].location != NSNotFound) {
+                    [self showToast:@"这一关清完了！"];
+                } else if ([st rangeOfString:@"stuck"].location != NSNotFound) {
+                    [self showToast:[NSString stringWithFormat:@"卡住：%@", st]];
+                } else if ([st rangeOfString:@"verifyfail"].location != NSNotFound) {
+                    [self showToast:[NSString stringWithFormat:@"自检不一致，已停：%@", st]];
+                } else {
+                    [self showToast:[NSString stringWithFormat:@"自动结束：%@", st]];
+                }
+            }
+        });
+    });
+}
+
+- (void)stopAuto {
+    gAutoOn = NO;
+    [self stopAutoPoll];
+    [self updateAutoButton];
+    hideAutoHud();
+    [self showToast:@"已停止自动"];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger best = -1;
+        NSArray<WKWebView *> *wes = webViewsWithInfo(NULL, &best);
+        if (wes.count && best >= 0 && (NSUInteger)best < wes.count) {
+            evalJS(wes[best], stopAutoJS(), 3.0);
+        }
+    });
+}
+
+- (void)btnAuto {
+    if (gAutoOn) { [self stopAuto]; return; }
+    [self showToast:@"启动自动…"];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger best = -1;
+        NSArray<WKWebView *> *wes = webViewsWithInfo(NULL, &best);
+        NSString *res = @"需要在游戏关卡里";
+        if (wes.count && best >= 0 && (NSUInteger)best < wes.count) {
+            res = evalJS(wes[best], startAutoJS(), 8.0);
+        }
+        NSString *r = res ?: @"无返回";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if ([r hasPrefix:@"AUTO_START"]) {
+                gAutoOn = YES;
+                [self updateAutoButton];
+                [self startAutoPoll];
+                updateAutoHud(@"自动：启动中…");
+                [self hide];
+                [self showToast:@"自动运行中。要停：点 RG 小球 → 点「停止自动」"];
+            } else {
+                [self showToast:[NSString stringWithFormat:@"启动失败：%@", r]];
+            }
+        });
+    });
+}
+
+// 「清除标注」：顺手把自动也停掉，避免盘面上留着过期的圈
+- (void)btnClearMarks {
+    if (gAutoOn) [self stopAuto];
+    hideSolverMarkers();
+    hideAutoHud();
+    [self showToast:@"已清除标注"];
 }
 
 #pragma mark - Recording: start / stop
