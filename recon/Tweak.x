@@ -66,6 +66,11 @@ static BOOL isOwnWindow(UIWindow *w) {
     return [w isKindOfClass:[AutoWindow class]];
 }
 
+// 关键：必须抬高 windowLevel。默认是 UIWindowLevelNormal(0)，和支付宝/游戏窗口
+// 同层级，触摸会先被游戏所在的窗口吃掉 —— 表现就是"球看得见，但点不动"。
+// v11 的求解面板用的是 9999/10000/10001，这里沿用 10000。
+static const UIWindowLevel kOverlayLevel = 10000.0;
+
 static UIWindow *makeOverlayWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
     for (UIScene *s in app.connectedScenes) {
@@ -74,6 +79,7 @@ static UIWindow *makeOverlayWindow(void) {
             UIWindowScene *ws = (UIWindowScene *)s;
             AutoWindow *w = [[AutoWindow alloc] initWithWindowScene:ws];
             w.frame = ws.coordinateSpace.bounds;
+            w.windowLevel = kOverlayLevel;
             return w;
         }
     }
@@ -82,10 +88,13 @@ static UIWindow *makeOverlayWindow(void) {
             UIWindowScene *ws = (UIWindowScene *)s;
             AutoWindow *w = [[AutoWindow alloc] initWithWindowScene:ws];
             w.frame = ws.coordinateSpace.bounds;
+            w.windowLevel = kOverlayLevel;
             return w;
         }
     }
-    return [[AutoWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    AutoWindow *w = [[AutoWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    w.windowLevel = kOverlayLevel;
+    return w;
 }
 
 // dispatch_sync 到主队列，如果已经在主队列上会死锁。
@@ -240,13 +249,13 @@ static UIView   *gBox = nil;
 static UIButton *gBtn = nil;
 static UILabel  *gStat = nil;
 static BOOL      gRunning = NO;
-static BOOL      gDragged = NO;
 static dispatch_source_t gPoll = nil;
 
 @interface AutoController : NSObject
 + (instancetype)shared;
 - (void)installUI;
 - (void)onPan:(UIPanGestureRecognizer *)g;
+- (void)onTapBtn;
 - (void)toggleAuto;
 - (void)startAuto;
 - (void)stopAuto;
@@ -280,7 +289,9 @@ static dispatch_source_t gPoll = nil;
         gWin.hidden = NO;
 
         CGSize sz = root.view.bounds.size;
-        gBox = [[UIView alloc] initWithFrame:CGRectMake(sz.width - 74.0, sz.height * 0.60, 66.0, 92.0)];
+        // 用 PassthroughView 当托盘：球和状态字之外的那几像素空白也会漏给游戏，
+        // 不会在球边上形成一小块"点了没反应"的死区。
+        gBox = [[PassthroughView alloc] initWithFrame:CGRectMake(sz.width - 74.0, sz.height * 0.60, 66.0, 92.0)];
         gBox.backgroundColor = [UIColor clearColor];
         gBox.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
         [root.view addSubview:gBox];
@@ -297,8 +308,18 @@ static dispatch_source_t gPoll = nil;
         gBtn.layer.borderColor = [UIColor whiteColor].CGColor;
         [gBox addSubview:gBtn];
 
+        // 点击必须走 UIControl 事件，不能靠 pan 手势的 Ended 分支：
+        // UIPanGestureRecognizer 在手指几乎不移动时压根不会进 Began/Ended，
+        // 而是直接 failed —— 于是"轻点球"永远不触发，表现就是点不动。
+        [gBtn addTarget:self
+                 action:@selector(onTapBtn)
+       forControlEvents:UIControlEventTouchUpInside];
+
+        // 拖动移动位置。pan 一旦识别成功会自动取消按钮的 touch，
+        // 所以"拖动"不会误触发"点击"，两者互不干扰。
         UIPanGestureRecognizer *pan =
             [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
+        pan.cancelsTouchesInView = YES;
         [gBtn addGestureRecognizer:pan];
 
         gStat = [[UILabel alloc] initWithFrame:CGRectMake(0.0, 62.0, 66.0, 30.0)];
@@ -316,25 +337,22 @@ static dispatch_source_t gPoll = nil;
     });
 }
 
-// 拖动移动位置；没移动就当成点击。
+// 只负责拖动。点击交给 UIControlEventTouchUpInside（见 onTapBtn）。
 - (void)onPan:(UIPanGestureRecognizer *)g {
     UIView *host = gBox.superview;
     if (!host) return;
+    if (g.state != UIGestureRecognizerStateChanged) return;
     CGPoint t = [g translationInView:host];
-    if (g.state == UIGestureRecognizerStateBegan) {
-        gDragged = NO;
-    } else if (g.state == UIGestureRecognizerStateChanged) {
-        if (t.x > 4.0 || t.x < -4.0 || t.y > 4.0 || t.y < -4.0) gDragged = YES;
-        CGFloat w = host.bounds.size.width, h = host.bounds.size.height;
-        CGFloat nx = gBox.center.x + t.x, ny = gBox.center.y + t.y;
-        nx = MAX(34.0, MIN(w - 34.0, nx));
-        ny = MAX(48.0, MIN(h - 46.0, ny));
-        gBox.center = CGPointMake(nx, ny);
-        [g setTranslation:CGPointZero inView:host];
-    } else if (g.state == UIGestureRecognizerStateEnded ||
-               g.state == UIGestureRecognizerStateCancelled) {
-        if (!gDragged) [self toggleAuto];
-    }
+    CGFloat w = host.bounds.size.width, h = host.bounds.size.height;
+    CGFloat nx = gBox.center.x + t.x, ny = gBox.center.y + t.y;
+    nx = MAX(34.0, MIN(w - 34.0, nx));
+    ny = MAX(48.0, MIN(h - 46.0, ny));
+    gBox.center = CGPointMake(nx, ny);
+    [g setTranslation:CGPointZero inView:host];
+}
+
+- (void)onTapBtn {
+    [self toggleAuto];
 }
 
 - (void)toggleAuto {
