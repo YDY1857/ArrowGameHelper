@@ -41,13 +41,18 @@
 
 ```
 ArrowGameHelperTweak/
-├── Makefile / control / ArrowGameHelper.plist / Tweak.x   # 求解版（手动网格 + 求解 + 覆盖层）
+├── Makefile / control / ArrowGameHelper.plist / Tweak.x   # 早期求解版（Logos，未在当前环境使用）
 ├── Solver.h / Solver.m                                   # 核心回溯求解器
-├── recon/                                                # 侦察版（采集运行时信息）
-│   ├── Makefile / control / ArrowGameRecon.plist / Tweak.x
+├── recon/                                                # ★ 现在用的就是这个
+│   ├── Makefile / control / ArrowGameRecon.plist
+│   ├── Tweak.x                                           # v12 极简自动版（462 行，只有一个悬浮球）
+│   └── archive/Tweak.full-v11.x                           # 完整侦察版（不参与编译，排查问题时换回来）
 ├── .github/workflows/build.yml                           # 一次编译出两个 deb
 └── README.md
 ```
+
+> **编译产物**：注入用的是 `recon/` 这个 target 产出的 `ArrowGameRecon.dylib`。
+> 名字虽然还叫 Recon，但 v12 起内容已经是纯自动版了 —— 改名会让注入工具的路径失效，所以没动。
 
 ---
 
@@ -179,6 +184,9 @@ git push -u origin main
 ---
 
 ## 深度探针（v9，首要用法）
+
+> ⚠ **v12 起 `recon/Tweak.x` 已精简为纯自动版，下面这些侦察功能全部移到 `recon/archive/Tweak.full-v11.x`。**
+> 需要深度探针 / PASS 判决 / 标号模式时，把两个文件名对调再编译即可。
 
 引擎已经确认是 **Cocos Creator 3.8.4**，游戏跑在 `PLDWebView` 里一个**同源 iframe** (`game-iframe.html`) 中，
 `cc` / `my` / `MYGameGlobal` 都挂在那个 iframe 的 window 上。所以**游戏状态可以直接读**：
@@ -362,35 +370,61 @@ pt    = (world.x * K, (visibleSize.height - world.y) * K)        K = frameSize.w
 
 ---
 
-## 全自动（v11，现在最省事的用法）
+## 全自动（v12，极简版：只有一个球）
 
-v10 的标号位置被实测确认后，v11 直接把"点"也接管了。**不伪造触摸事件** ——
-游戏自己的触摸层最终就是调 `onArrowTouchStart(arrowList, lineID, auto)`，我们直接调它：
+v10 的标号位置被实测确认后，v11 接管了"点"，v12 又做了两件事：**提速 15 倍** + **砍到只剩一个按钮**。
+
+### 为什么快
+
+游戏 `onArrowTouchStart` 里，主滑动画之后还有一条**硬编码 1 秒**的收尾动画，之后才 `t.forEach(t => t.active = false)`。
+v11 是"等杆变 inactive 再点下一条"，所以每步必然被这 1 秒卡住。
+
+关键发现：**`clearLinePos(i)`（清占用表）和 `oneCheckGameWin()` 都在动画开始之前同步执行完了。**
+调用返回的瞬间游戏状态已经更新完毕，剩下的是纯动画表演。所以 v12 点完立刻自己收杆：
 
 ```js
-as.onArrowTouchStart(as.arrowNodeList[i], i, false)
+as.onArrowTouchStart(N[pick], pick, false);   // 同步部分已完成
+kill(pick);                                    // 立刻置 inactive，不等 1 秒尾动画
+setTimeout(step, 60);                          // 60ms 后点下一条
 ```
 
-走的是和手指完全一样的代码路径，`hideShowArrowTouch` / `clearLinePos` / `checkGameWin` /
-`soundIndex` 全部由游戏自己维护，**内部状态不会漂移**。伪造 `UITouch` 要碰私有 ivar，每代 iOS 都可能失效，不值当。
+一步从 ~1000ms 降到 **60ms**，一关 165 条约 **11~15 秒**（原来近 3 分钟）。常量在文件顶部：
+`static const NSInteger kAutoDelayMs = 60;`
 
-**每一步都自检**：调用前先用游戏自己的 `checkPathPass()` 再判一次，只要它和我的求解器有一个不一致就立刻停手并提示，
-所以**自动模式下不会因为点错扣心**。
+### 为什么稳
 
-**节奏是事件驱动的**：点完一条会等那条箭头的所有杆节点变 `active=false`（游戏动画结束才置位）再点下一条，
-不硬刷。整个循环跑在页面内的 `setTimeout` 链里，ObjC 只每 500 ms 读一个短状态串回填 HUD，不做 165 次往返。
+仍然**不伪造触摸** —— `onArrowTouchStart(arrowList, lineID, auto)` 就是触摸层最终调用的函数，
+`clearLinePos` / `checkGameWin` / `soundIndex` 全部由游戏自己维护，状态不会漂移。
 
-### 用法
+仍然是**每步自检**：动手前用游戏自己的 `checkPathPass()` 复核，不一致就等 90ms 重试（最多 6 次），
+仍不一致则立刻停手并提示「自检不符」—— 不会因为点错扣心。
 
-进关卡 → 点 RG 小球 → 点橙色 **「自动通关（全自动）」** → 放下手机。
-屏幕上方出现进度条 `自动：run=1 step=37 alive=128 last=52 msg=moved 52`。
-要停：点 RG 小球 → 面板 → 「停止自动」（或「清除标注」）。
+### 界面
+
+| 状态 | 球 | 点它 |
+|---|---|---|
+| 绿色「自动」 | 待机 | 开始 |
+| 红色「停止」 | 运行中 | 立刻停下 |
+
+球下面是 `37步 / 剩128`，结束显示 `已通关` / `卡住了` / `自检不符` / `已停止`。
+**球可以拖动**（按住拖，松手不触发）。
+
+### 精简结果
+
+| | v11 | v12 |
+|---|---|---|
+| 代码量 | 2320 行 / 116 KB | **462 行 / 20 KB** |
+| 按钮 | 面板 7 个 | **1 个悬浮球** |
+
+深度探针 / 录制 / 标号 / 缓存导出 / 报告分享全部移出主文件，
+完整版归档在 **`recon/archive/Tweak.full-v11.x`**（`recon/Makefile` 里 `ArrowGameRecon_FILES = Tweak.x`，
+只编译根目录那一个，子目录不参与构建）。要排查问题时把两边文件名换一下即可。
 
 ### 注意
 
-- **这是自动化操作**。节奏跟着游戏动画走（约每秒 1~3 条），不是暴力刷，但连续跑很多关和手动玩的风险不一样 —— 自行权衡。
-- 过关后**不会自动进下一关**（要自己点"下一关"）。代码结构已支持做自动连关。
-- 全自动**不依赖屏幕坐标**（直接调函数），所以缩放/拖动完全不影响；只有"手动标号"模式会受缩放影响。
+- **这是自动化操作**，60ms 一步、一关十几秒，比手动快得多，风控上肯定和手动不一样 —— **别挂着连刷几十关**。
+- 过关后**不会自动进下一关**（要自己点"下一关"）。要自动连关说一声，加几行就行。
+- 全自动**不依赖屏幕坐标**（直接调函数），缩放/拖动完全不影响。
 
 ---
 
