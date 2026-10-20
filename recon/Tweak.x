@@ -7,11 +7,14 @@
 // 注入到重签名后的支付宝。进到箭头小游戏关卡，点悬浮球「自动」，它自己通关；
 // 再点一下变成「停止」。球可以拖动到任意位置。
 //
-// 为什么快：
+// 节奏与动画：
 //   游戏 onArrowTouchStart 里，主滑动画结束后还有一条**硬编码 1 秒**的尾动画，
-//   之后才把杆节点置为 inactive —— 等它就必然一步一秒。
-//   但 clearLinePos(i)（清占用表）和 oneCheckGameWin() 都在动画**开始之前**
-//   就同步执行完了，所以点完立刻自己把杆置为 inactive 即可，不必等尾动画。
+//   之后才把杆节点置为 inactive。等它就必然一步一秒。
+//   但 clearLinePos(i)（清占用表）在动画**开始之前**就同步跑完了，所以"逻辑上
+//   这条线已经空了"，只是画面上还在滑。
+//   所以本版不碰动画：点完就让它滑，我们只在自己的 done 表里记下"这条已点过"，
+//   算占用、挑下一条时把它排除 —— 既不撞格，也能看到正常的滑动效果。
+//   只有当游戏意外没在尾动画后置 inactive 时，1.7 秒兜底接管。
 //   间隔由 kAutoDelayMs 控制，当前 500ms —— 约 0.5 秒点一下。
 //
 // 为什么这么点：
@@ -31,7 +34,7 @@
 // ---- 可调参数 --------------------------------------------------------------
 static const NSInteger kAutoDelayMs    = 500;   // 两次点击之间的间隔（毫秒）。500 ≈ 0.5 秒一下
 static const NSInteger kAutoMaxSteps   = 420;   // 单次自动的步数上限（防跑飞）
-static const NSInteger kMaxVerifyRetry = 6;     // checkPathPass 不一致时的重试次数
+static const NSInteger kMaxVerifyRetry = 8;     // checkPathPass 不一致时的重试次数
 
 // ---- 触摸穿透 --------------------------------------------------------------
 // 只有真正命中子视图才吃触摸，空白区一律放行给下面的 App。
@@ -165,7 +168,13 @@ static NSString *evalJS(WKWebView *webView, NSString *js, NSTimeInterval timeout
 
 #pragma mark - 自动循环（JS）
 
-// 在游戏帧内自驱动：求解 -> 游戏自检 -> 调 onArrowTouchStart -> 立刻收杆 -> 下一步
+// 在游戏帧内自驱动：求解 -> 游戏自检 -> 调 onArrowTouchStart -> 下一步
+//
+// 关键：**不再手动 kill**。点完就交给游戏自己的 1 秒尾动画去播，滑出去、自己置
+// inactive。我们只维护自己的 done 表：算占用/挑下一条时把"已点过的"排除掉。
+// 这样视觉上是正常的一条条滑走，而求解节奏仍然是 DELAY 一步。
+// （游戏 clearLinePos 在 onArrowTouchStart 里同步执行，所以它那边的占用早已释放，
+//   我们的 done 表和它的真实状态是一致的 —— 不会撞格。）
 static NSString *startAutoJS(NSInteger delayMs, NSInteger maxSteps, NSInteger maxRetry) {
     return [NSString stringWithFormat:
     @"(function(){var W=null;"
@@ -185,7 +194,7 @@ static NSString *startAutoJS(NSInteger delayMs, NSInteger maxSteps, NSInteger ma
     @"var GW=gs.gridWidth,GH=gs.gridHeight,A=as.arrowAllPointList||[],N=as.arrowNodeList||[];"
     @"if(!A.length)return 'NO_ARROWS';"
     @"var DELAY=%ld,MAXSTEP=%ld,MAXTRY=%ld;"
-    @"var st={running:1,step:0,alive:0,lastIdx:-1,msg:'start',delay:DELAY};W.__reconAuto=st;"
+    @"var st={running:1,step:0,alive:0,wait:0,lastIdx:-1,msg:'start',delay:DELAY};W.__reconAuto=st;"
     @"function live(i){var r=null;try{r=N[i]}catch(e){return 0}"
     @"if(!r||!r.length)return 0;"
     @"for(var z=0;z<r.length;z++){var nd=r[z];if(nd&&(nd.active===true||(nd.node&&nd.node.active===true)))return 1}"
@@ -198,24 +207,39 @@ static NSString *startAutoJS(NSInteger delayMs, NSInteger maxSteps, NSInteger ma
     @"r+=d[0];c+=d[1];"
     @"while(r>=0&&r<GH&&c>=0&&c<GW){if(occ[r*GW+c])return false;r+=d[0];c+=d[1]}"
     @"return true}"
-    @"var tries=0;"
+    @"var done={},kt={},tries=0;"
+    // 兜底：正常路径下游戏会在「滑动 k 秒 + 尾动画 1 秒」后自己置 inactive。
+    // 万一动画被掐掉/掉帧，2.6 秒后我们收杆，避免残影一直挂在画面上。
+    @"function watch(i){if(kt[i])return;kt[i]=1;W.setTimeout(function(){if(live(i))kill(i)},2600);}"
     @"var step=function(){"
     @"if(!st.running){st.msg='stopped';return;}"
     @"if(st.step>MAXSTEP){st.running=0;st.msg='stepcap';return;}"
-    @"var al=[],occ={};"
-    @"for(var i=0;i<A.length;i++){if(!live(i))continue;al.push(i);var cs=A[i];for(var j=0;j<cs.length;j++)occ[cs[j]]=1;}"
+    // 换关卡时 ArrowSystem 重新生成数组 —— 引用一变就清空 done，避免把新关卡的箭头当成旧账。
+    @"try{if(as.arrowAllPointList!==A){A=as.arrowAllPointList||[];N=as.arrowNodeList||[];done={};kt={};st.wait=0;}}catch(e){}"
+    @"var al=[],occ={},anim=0;"
+    @"for(var i=0;i<A.length;i++){"
+    @"if(done[i]){if(live(i))anim++;continue;}"
+    @"if(!live(i))continue;"
+    @"al.push(i);var cs=A[i];for(var j=0;j<cs.length;j++)occ[cs[j]]=1;}"
     @"st.alive=al.length;"
-    @"if(!al.length){try{as.checkGameWin()}catch(e){};st.running=0;st.msg='cleared';return;}"
+    // 全部点完：最后一两条可能还在滑，等尾动画播完再判胜负（最多 12*200ms）
+    @"if(!al.length){"
+    @"if(anim>0&&st.wait<12){st.wait++;st.msg='wait '+anim;W.setTimeout(step,200);return;}"
+    @"try{as.checkGameWin()}catch(e){}"
+    @"st.running=0;st.msg='cleared';return;}"
     @"var pick=-1;"
     @"for(var q=0;q<al.length;q++){if(ok(al[q],occ)){pick=al[q];break;}}"
     @"if(pick<0){st.running=0;st.msg='stuck alive='+al.length;return;}"
     @"var vd=-99;try{vd=as.checkPathPass(N[pick])}catch(e){vd=-98;}"
-    @"if(vd!==-1){tries++;if(tries<=MAXTRY){W.setTimeout(step,90);return;}"
+    // checkPathPass 读的是网格占用表（clearLinePos 已同步清空），所以走到这里的不一致是
+    // 真实冲突（比如特殊箭头的连锁自动通过正在改表），重试几拍再看，别急着点。
+    @"if(vd!==-1){tries++;"
+    @"if(tries<=MAXTRY){W.setTimeout(step,90);return;}"
     @"st.running=0;st.msg='verifyfail i='+pick+' v='+vd;return;}"
     @"tries=0;"
     @"try{as.onArrowTouchStart(N[pick],pick,false)}catch(e){st.running=0;st.msg='callerr '+e;return;}"
-    @"kill(pick);"
-    @"st.step++;st.lastIdx=pick;st.msg='moved '+pick;"
+    @"done[pick]=1;watch(pick);"
+    @"st.step++;st.lastIdx=pick;st.wait=0;st.msg='moved '+pick;"
     @"W.setTimeout(step,DELAY);};"
     @"W.setTimeout(step,120);"
     @"return 'AUTO_START total='+A.length+' delay='+DELAY;})()",
