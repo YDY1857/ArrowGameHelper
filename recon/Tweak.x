@@ -12,7 +12,7 @@
 //   之后才把杆节点置为 inactive —— 等它就必然一步一秒。
 //   但 clearLinePos(i)（清占用表）和 oneCheckGameWin() 都在动画**开始之前**
 //   就同步执行完了，所以点完立刻自己把杆置为 inactive 即可，不必等尾动画。
-//   实测节奏从 ~1000ms/步 降到 60ms/步。
+//   间隔由 kAutoDelayMs 控制，当前 500ms —— 约 0.5 秒点一下。
 //
 // 为什么这么点：
 //   没有伪造 UITouch。onArrowTouchStart(arrowList, lineID, auto) 就是触摸层
@@ -29,7 +29,7 @@
 // ============================================================================
 
 // ---- 可调参数 --------------------------------------------------------------
-static const NSInteger kAutoDelayMs    = 60;    // 每一步之间的间隔（毫秒）
+static const NSInteger kAutoDelayMs    = 500;   // 两次点击之间的间隔（毫秒）。500 ≈ 0.5 秒一下
 static const NSInteger kAutoMaxSteps   = 420;   // 单次自动的步数上限（防跑飞）
 static const NSInteger kMaxVerifyRetry = 6;     // checkPathPass 不一致时的重试次数
 
