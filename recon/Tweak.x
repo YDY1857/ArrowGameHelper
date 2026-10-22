@@ -268,16 +268,47 @@ static NSString *stopAutoJS(void) {
 
 #pragma mark - 悬浮按钮
 
+// ---- 尺寸与吸边 ------------------------------------------------------------
+static const CGFloat kIdleD   = 34.0;    // 待机直径（缩到这么小，贴边不挡手）
+static const CGFloat kRunD    = 58.0;    // 运行 / 拖动时直径
+static const CGFloat kIdlePad = 6.0;     // 待机时距屏幕边缘
+static const CGFloat kRunPad  = 10.0;    // 运行时距屏幕边缘
+static const CGFloat kStatH   = 28.0;    // 球下面那两行状态字的高度
+
 static UIWindow *gWin = nil;
 static UIView   *gBox = nil;
 static UIButton *gBtn = nil;
 static UILabel  *gStat = nil;
 static BOOL      gRunning = NO;
+static BOOL      gOpen = NO;             // 拖动中临时展开
+static NSTimeInterval gHoldUntil = 0.0;  // 结束后保持展开、把结果给人看清的截止时间
 static dispatch_source_t gPoll = nil;
+
+static inline BOOL nearF(CGFloat a, CGFloat b) {
+    CGFloat d = a - b;
+    return (d > -0.5 && d < 0.5);
+}
+
+// 待机的球只有 34pt，手指容易点偏。把热区向外扩 6pt，但视觉尺寸不变 ——
+// 扩出来的那圈仍然返回球本身，别的地方照旧漏给游戏。
+@interface BallBox : PassthroughView
+@end
+
+@implementation BallBox
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (gBtn && CGRectContainsPoint(CGRectInset(self.bounds, -6.0, -6.0), point)) {
+        return gBtn;
+    }
+    return [super hitTest:point withEvent:event];
+}
+@end
 
 @interface AutoController : NSObject
 + (instancetype)shared;
 - (void)installUI;
+- (BOOL)isOpen;
+- (void)holdThenShrink:(NSTimeInterval)sec;
+- (void)applyLayout:(BOOL)animated;
 - (void)onPan:(UIPanGestureRecognizer *)g;
 - (void)onTapBtn;
 - (void)toggleAuto;
@@ -313,40 +344,39 @@ static dispatch_source_t gPoll = nil;
         gWin.hidden = NO;
 
         CGSize sz = root.view.bounds.size;
-        // 用 PassthroughView 当托盘：球和状态字之外的那几像素空白也会漏给游戏，
-        // 不会在球边上形成一小块"点了没反应"的死区。
-        gBox = [[PassthroughView alloc] initWithFrame:CGRectMake(sz.width - 74.0, sz.height * 0.60, 66.0, 92.0)];
+
+        // 托盘用 PassthroughView：球和状态字之外的空白漏给游戏，不留"点了没反应"的死区。
+        // 初始就是待机小尺寸，贴在右侧偏下的位置。
+        gBox = [[BallBox alloc] initWithFrame:CGRectMake(0.0, 0.0, kIdleD, kIdleD)];
         gBox.backgroundColor = [UIColor clearColor];
-        gBox.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+        gBox.center = CGPointMake(sz.width - kIdlePad - kIdleD * 0.5, sz.height * 0.62);
         [root.view addSubview:gBox];
 
         gBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        gBtn.frame = CGRectMake(4.0, 0.0, 58.0, 58.0);
+        gBtn.frame = CGRectMake(0.0, 0.0, kIdleD, kIdleD);
         gBtn.titleLabel.numberOfLines = 2;
         gBtn.titleLabel.textAlignment = NSTextAlignmentCenter;
         gBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
         [gBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        gBtn.layer.cornerRadius = 29.0;
+        gBtn.layer.cornerRadius = kIdleD * 0.5;
         gBtn.layer.masksToBounds = YES;
-        gBtn.layer.borderWidth = 2.0;
-        gBtn.layer.borderColor = [UIColor whiteColor].CGColor;
+        gBtn.layer.borderWidth = 1.5;
+        gBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.85].CGColor;
         [gBox addSubview:gBtn];
 
         // 点击必须走 UIControl 事件，不能靠 pan 手势的 Ended 分支：
-        // UIPanGestureRecognizer 在手指几乎不移动时压根不会进 Began/Ended，
-        // 而是直接 failed —— 于是"轻点球"永远不触发，表现就是点不动。
+        // UIPanGestureRecognizer 在手指几乎不移动时压根不会进 Began/Ended，直接 failed。
         [gBtn addTarget:self
                  action:@selector(onTapBtn)
        forControlEvents:UIControlEventTouchUpInside];
 
-        // 拖动移动位置。pan 一旦识别成功会自动取消按钮的 touch，
-        // 所以"拖动"不会误触发"点击"，两者互不干扰。
+        // 拖动移动位置。pan 一旦识别成功会自动取消按钮的 touch，所以拖动不会误触发点击。
         UIPanGestureRecognizer *pan =
             [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
         pan.cancelsTouchesInView = YES;
         [gBtn addGestureRecognizer:pan];
 
-        gStat = [[UILabel alloc] initWithFrame:CGRectMake(0.0, 62.0, 66.0, 30.0)];
+        gStat = [[UILabel alloc] initWithFrame:CGRectMake(0.0, kIdleD + 2.0, kIdleD, kStatH)];
         gStat.numberOfLines = 2;
         gStat.textAlignment = NSTextAlignmentCenter;
         gStat.font = [UIFont boldSystemFontOfSize:8];
@@ -355,24 +385,102 @@ static dispatch_source_t gPoll = nil;
         gStat.layer.cornerRadius = 5.0;
         gStat.layer.masksToBounds = YES;
         gStat.userInteractionEnabled = NO;
+        gStat.hidden = YES;                 // 待机时不显示，省地方
         [gBox addSubview:gStat];
 
         [self refreshUI:@"就绪"];
     });
 }
 
-// 只负责拖动。点击交给 UIControlEventTouchUpInside（见 onTapBtn）。
+// 展开条件：运行中、拖动中、或者刚跑完还在展示结果。
+- (BOOL)isOpen {
+    return (gRunning || gOpen || [NSDate timeIntervalSinceReferenceDate] < gHoldUntil);
+}
+
+// 结束后别立刻缩，留几秒把「已通关 / 卡住了 / 自检不符 / 失败:xxx」看清楚。
+- (void)holdThenShrink:(NSTimeInterval)sec {
+    gHoldUntil = [NSDate timeIntervalSinceReferenceDate] + sec;
+    [self applyLayout:YES];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self applyLayout:YES];
+    });
+}
+
+// 球心不动，换尺寸/吸边。待机 = 小圆点贴边；运行或拖动 = 展开。
+- (void)applyLayout:(BOOL)animated {
+    if (!gBox || !gBtn || !gBox.superview) return;
+    UIView *host = gBox.superview;
+    CGFloat w = host.bounds.size.width, h = host.bounds.size.height;
+
+    BOOL open = [self isOpen];
+    CGFloat d = open ? kRunD : kIdleD;
+    CGFloat pad = open ? kRunPad : kIdlePad;
+    CGFloat boxH = open ? (d + kStatH + 2.0) : d;
+
+    // 以球的圆心为锚点：展开/收起时球本身不跳位置
+    CGFloat ballCY = gBox.frame.origin.y + gBtn.bounds.size.height * 0.5;
+    ballCY = MAX(d * 0.5 + 26.0, MIN(h - d * 0.5 - 26.0, ballCY));
+
+    BOOL onLeft = (gBox.center.x < w * 0.5);
+    CGFloat cx = onLeft ? (pad + d * 0.5) : (w - pad - d * 0.5);
+
+    CGRect nf = CGRectMake(cx - d * 0.5, ballCY - d * 0.5, d, boxH);
+    CGRect bf = CGRectMake(0.0, 0.0, d, d);
+    CGRect sf = CGRectMake(0.0, d + 2.0, d, kStatH);
+    CGFloat alpha = open ? 1.0 : 0.92;
+
+    gStat.hidden = !open;
+    gBox.alpha = alpha;
+
+    CGRect cf = gBox.frame;
+    if (nearF(cf.origin.x, nf.origin.x) && nearF(cf.origin.y, nf.origin.y) &&
+        nearF(cf.size.width, nf.size.width) && nearF(cf.size.height, nf.size.height)) {
+        return;   // 已经在目标状态，别每 250ms 重复起动画
+    }
+
+    void (^blk)(void) = ^{
+        gBox.frame = nf;
+        gBtn.frame = bf;
+        gBtn.layer.cornerRadius = d * 0.5;
+        gStat.frame = sf;
+        gBox.alpha = alpha;
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.22
+                              delay:0.0
+                            options:UIViewAnimationOptionBeginFromCurrentState |
+                                    UIViewAnimationOptionAllowUserInteraction
+                         animations:blk
+                         completion:nil];
+    } else {
+        blk();
+    }
+}
+
+// 拖动：按下先展开（手指好抓），移动跟手，松手吸附最近的左右边。
 - (void)onPan:(UIPanGestureRecognizer *)g {
     UIView *host = gBox.superview;
     if (!host) return;
-    if (g.state != UIGestureRecognizerStateChanged) return;
-    CGPoint t = [g translationInView:host];
-    CGFloat w = host.bounds.size.width, h = host.bounds.size.height;
-    CGFloat nx = gBox.center.x + t.x, ny = gBox.center.y + t.y;
-    nx = MAX(34.0, MIN(w - 34.0, nx));
-    ny = MAX(48.0, MIN(h - 46.0, ny));
-    gBox.center = CGPointMake(nx, ny);
-    [g setTranslation:CGPointZero inView:host];
+    if (g.state == UIGestureRecognizerStateBegan) {
+        gOpen = YES;
+        [self applyLayout:YES];
+    } else if (g.state == UIGestureRecognizerStateChanged) {
+        CGPoint t = [g translationInView:host];
+        CGPoint c = gBox.center;
+        CGFloat w = host.bounds.size.width, h = host.bounds.size.height;
+        CGFloat d = gBtn.bounds.size.width;
+        c.x += t.x;
+        c.y += t.y;
+        c.x = MAX(d * 0.5 + 2.0, MIN(w - d * 0.5 - 2.0, c.x));
+        c.y = MAX(46.0, MIN(h - 70.0, c.y));
+        gBox.center = c;
+        [g setTranslation:CGPointZero inView:host];
+    } else if (g.state == UIGestureRecognizerStateEnded ||
+               g.state == UIGestureRecognizerStateCancelled) {
+        gOpen = NO;                    // 松手就归位：未运行的话顺势缩回小圆点
+        [self applyLayout:YES];
+    }
 }
 
 - (void)onTapBtn {
@@ -387,14 +495,17 @@ static dispatch_source_t gPoll = nil;
 - (void)refreshUI:(NSString *)sub {
     runOnMainSync(^{
         if (!gBtn) return;
+        BOOL open = [self isOpen];
         if (gRunning) {
             [gBtn setTitle:@"停止" forState:UIControlStateNormal];
             gBtn.backgroundColor = [UIColor colorWithRed:0.86 green:0.20 blue:0.16 alpha:0.94];
         } else {
-            [gBtn setTitle:@"自动" forState:UIControlStateNormal];
+            // 缩成小圆点时只留一个 ▶，看得懂又不占字宽
+            [gBtn setTitle:(open ? @"自动" : @"▶") forState:UIControlStateNormal];
             gBtn.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.32 alpha:0.94];
         }
         if (gStat) gStat.text = sub ?: @"";
+        [self applyLayout:YES];
     });
 }
 
@@ -413,6 +524,7 @@ static dispatch_source_t gPoll = nil;
                 gRunning = NO;
                 NSString *m = r.length > 22 ? [r substringToIndex:22] : r;
                 [self refreshUI:[NSString stringWithFormat:@"失败:%@", m]];
+                [self holdThenShrink:4.0];
             }
         });
     });
@@ -472,6 +584,7 @@ static dispatch_source_t gPoll = nil;
             }
             gRunning = NO;
             [self stopPoll];
+            [self holdThenShrink:3.5];
             if ([msg rangeOfString:@"cleared"].location != NSNotFound) {
                 [self refreshUI:@"已通关"];
             } else if ([msg rangeOfString:@"stuck"].location != NSNotFound) {
